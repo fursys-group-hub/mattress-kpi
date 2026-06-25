@@ -1,0 +1,16 @@
+# 접속 정보 (GitHub 업로드 금지)
+.env
+
+# 로컬 실행용
+실행.bat
+
+# 1회성 마이그레이션 스크립트 (개인정보 포함)
+migrate_owners_once.js
+
+# 기타 로컬 전용
+node_modules/
+package.json
+package-lock.json
+grd_list_*.xls
+grd_list_*.xlsx
+퀼팅 설비 현황.html
