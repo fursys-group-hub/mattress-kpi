@@ -4471,12 +4471,12 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
   // 일자·작업자 변경 시 — 그 일자+작업자 entry 있으면 로드 (date+owner unique key)
   useEffect(() => {
     if (skipReloadRef.current) { skipReloadRef.current = false; return; }
-    // 편집 모드(editingEntryId 설정됨): 작업자 변경 시 records 초기화 방지
     if (editingEntryId) return;
+    if (originalRecords.length) return; // 인식 직후 — 저장 전까지 records 보호
     const ex = bunghalLog.find(e => e.date === inputDate && (e.owner || '') === (inputOwner || '').trim());
     setInputRecords(ex && ex.records ? ex.records : [makeEmptyBunghalRecord()]);
     setProductionRecords(ex && ex.productionRecords ? ex.productionRecords : [makeEmptyProductionRecord()]);
-  }, [inputDate, inputOwner, bunghalLog]); // editingEntryId는 의도적으로 deps 제외
+  }, [inputDate, inputOwner, bunghalLog, originalRecords]); // editingEntryId는 의도적으로 deps 제외
 
   const handleSaveOwner = (name) => {
     setInputOwner(name);
@@ -4991,7 +4991,7 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
       {ownerSelectModal && catalog.owners && catalog.owners.length > 0 && (
         <OwnerSelectModal
           owners={catalog.owners}
-          onSelect={(owner) => { handleSaveOwner(owner); setOwnerSelectModal(false); }}
+          onSelect={(owner) => { skipReloadRef.current = true; handleSaveOwner(owner); setOwnerSelectModal(false); }}
           onClose={() => setOwnerSelectModal(false)}
         />
       )}
