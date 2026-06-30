@@ -1,6 +1,9 @@
 # 접속 정보 (GitHub 업로드 금지)
 .env
 
+# 배포 플러그인 산출물 (hash 문자열 오탐 방지)
+.fursys-deploy-hub/
+
 # 로컬 실행용
 실행.bat
 
