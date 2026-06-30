@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Literal
 import psycopg2.pool
@@ -19,6 +20,13 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _pool = psycopg2.pool.ThreadedConnectionPool(1, 5, DATABASE_URL)
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://josangwony.github.io"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.on_event("startup")
