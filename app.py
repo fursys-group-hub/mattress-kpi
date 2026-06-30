@@ -28,7 +28,7 @@ def startup():
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS public.kpidb (
+                CREATE TABLE IF NOT EXISTS kpidb (
                   env        TEXT NOT NULL,
                   key        TEXT NOT NULL,
                   value      TEXT,
@@ -36,7 +36,6 @@ def startup():
                   PRIMARY KEY (env, key)
                 )
             """)
-            cur.execute("ALTER TABLE public.kpidb DISABLE ROW LEVEL SECURITY")
         conn.commit()
         ok = True
         print("[DB] 테이블 준비 완료")
