@@ -11,6 +11,7 @@
 migrate_owners_once.js
 
 # 기타 로컬 전용
+__pycache__/
 node_modules/
 package.json
 package-lock.json

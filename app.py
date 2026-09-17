@@ -67,6 +67,15 @@ def root():
     return FileResponse(os.path.join(BASE_DIR, "index.html"), media_type="text/html; charset=utf-8")
 
 
+@app.get("/iloom_LOGO.png", include_in_schema=False)
+def logo():
+    # 디렉토리 전체를 mount하면 .env까지 노출되므로 파일 하나만 명시적으로 서빙
+    path = os.path.join(BASE_DIR, "iloom_LOGO.png")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="로고 파일 없음")
+    return FileResponse(path, media_type="image/png")
+
+
 @app.get("/api/data")
 def get_data(env: Literal["main", "dev"] = "main"):
     conn = _pool.getconn()

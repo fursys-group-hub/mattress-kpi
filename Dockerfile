@@ -9,6 +9,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 앱 소스 복사
 COPY app.py ./
 COPY index.html ./
+COPY iloom_LOGO.png ./
 
 EXPOSE 8000
 
