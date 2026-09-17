@@ -33,8 +33,15 @@
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({key, value: JSON.stringify(val)})
         });
-        if (!r.ok) console.warn('API set error', r.status);
-      } catch(e) { console.warn('API set error', e); }
+        if (!r.ok) {
+          console.warn('API set error', r.status);
+          return { ok: false, error: `서버 응답 ${r.status}` };
+        }
+        return { ok: true };
+      } catch(e) {
+        console.warn('API set error', e);
+        return { ok: false, error: (e && e.message) || '네트워크 오류' };
+      }
     },
     listen: (cb) => {
       const id = setInterval(async () => {
@@ -643,6 +650,68 @@ const DEFAULT_PRODUCT_CATALOG = {
   actions:   ['수선', '폐기'],
   owners:    ['인터 #1', '인터 #2'],
 };
+// UUID 생성 — crypto.randomUUID는 보안 컨텍스트(HTTPS·localhost)에서만 동작한다.
+// 사내망 http://<IP>:8000 접속에서도 행 추가·저장이 되도록 폴백을 둔다.
+function uuid() {
+  try { if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID(); } catch {}
+  const b = new Uint8Array(16);
+  try {
+    if (typeof crypto !== 'undefined' && crypto.getRandomValues) crypto.getRandomValues(b);
+    else throw new Error('no csprng');
+  } catch {
+    for (let i = 0; i < 16; i++) b[i] = Math.floor(Math.random() * 256);
+  }
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const h = Array.from(b, x => x.toString(16).padStart(2, '0'));
+  return [h.slice(0,4).join(''), h.slice(4,6).join(''), h.slice(6,8).join(''),
+          h.slice(8,10).join(''), h.slice(10,16).join('')].join('-');
+}
+
+// 서버 저장에 실패한 값 — 성공할 때까지 보관하고 재시도한다.
+const __pendingWrites = {};
+const SYNC_EVT = 'kpi-sync-state';
+function pendingWriteCount() { return Object.keys(__pendingWrites).length; }
+function __emitSyncState(detail) {
+  try { document.dispatchEvent(new CustomEvent(SYNC_EVT, { detail })); } catch {}
+}
+function __pushToServer(k, v) {
+  if (!window.__fb) return;
+  const finish = (res) => {
+    __localWriteAt[k] = Date.now(); // 유예 시간은 POST 완료 시점부터
+    if (res && res.ok === false) {
+      __pendingWrites[k] = v;
+      __emitSyncState({ key: k, ok: false, error: res.error, pending: pendingWriteCount() });
+    } else {
+      delete __pendingWrites[k];
+      __emitSyncState({ key: k, ok: true, pending: pendingWriteCount() });
+    }
+  };
+  let p;
+  try { p = window.__fb.set(k, v); } catch (e) { finish({ ok: false, error: (e && e.message) || '전송 오류' }); return; }
+  if (p && p.then) p.then(finish, (e) => finish({ ok: false, error: (e && e.message) || '네트워크 오류' }));
+  else finish({ ok: true });
+}
+function flushPendingWrites() {
+  Object.keys(__pendingWrites).forEach(k => __pushToServer(k, __pendingWrites[k]));
+  return pendingWriteCount();
+}
+
+// 미저장 작업 감시 — 새로고침·창 닫기 경고용. 각 입력 화면이 자기 dirty 판정을 등록한다.
+const __dirtyChecks = new Set();
+function registerDirtyCheck(fn) { __dirtyChecks.add(fn); return () => { __dirtyChecks.delete(fn); }; }
+function hasUnsavedWork() {
+  if (pendingWriteCount()) return true;
+  for (const f of __dirtyChecks) { try { if (f()) return true; } catch {} }
+  return false;
+}
+
+// 각 키를 마지막으로 반영했을 때의 직렬화 값 — 내용이 같은 폴링 응답을 걸러내기 위함
+const __syncRaw = {};
+// 로컬에서 마지막으로 저장한 시각 — POST 반영 전 폴링 GET이 옛 값으로 되돌리는 것을 막기 위함
+const __localWriteAt = {};
+const LOCAL_WRITE_GRACE_MS = 8000;
+
 const LS = {
   get: (k, fallback) => {
     try { const v = localStorage.getItem('kpi_' + k); return v ? JSON.parse(v) : fallback; }
@@ -650,24 +719,38 @@ const LS = {
   },
   set: (k, v) => {
     try { localStorage.setItem('kpi_' + k, JSON.stringify(v)); } catch {}
-    if (window.__fb) window.__fb.set(k, v);
+    try { __syncRaw[k] = JSON.stringify(v); } catch {}
+    __localWriteAt[k] = Date.now();
+    __pushToServer(k, v);
   }
 };
+
+// 서버 응답에서 '실제로 달라진 키'만 추려낸다.
+//  - 직렬화 결과가 직전과 같으면 무시 → 배열 참조가 유지되어 입력 중인 화면이 리셋되지 않음
+//  - 방금 로컬에서 저장한 키는 유예 시간 동안 무시 → 저장 직후 폴링이 옛 값으로 덮어쓰는 것 방지
+function pickChangedStore(d) {
+  const out = {};
+  const now = Date.now();
+  STORE_KEYS.forEach(k => {
+    if (!d || d[k] === undefined) return;
+    try {
+      const parsed = typeof d[k] === 'string' ? JSON.parse(d[k]) : d[k];
+      const raw = JSON.stringify(parsed);
+      if (__syncRaw[k] === raw) return;
+      if (__pendingWrites[k] !== undefined) return; // 서버 저장 실패분 — 덮어쓰면 입력이 사라진다
+      if (__localWriteAt[k] && now - __localWriteAt[k] < LOCAL_WRITE_GRACE_MS) return;
+      __syncRaw[k] = raw;
+      out[k] = parsed;
+      localStorage.setItem('kpi_' + k, JSON.stringify(parsed));
+    } catch {}
+  });
+  return out;
+}
+
 async function pullFB() {
   if (!window.__fb) return null;
   try {
-    const d = await window.__fb.get();
-    const out = {};
-    STORE_KEYS.forEach(k => {
-      if (d[k] !== undefined) {
-        try {
-          const parsed = typeof d[k] === 'string' ? JSON.parse(d[k]) : d[k];
-          out[k] = parsed;
-          localStorage.setItem('kpi_' + k, JSON.stringify(parsed));
-        } catch {}
-      }
-    });
-    return out;
+    return pickChangedStore(await window.__fb.get());
   } catch (e) { console.warn('FB pull error', e); return null; }
 }
 
@@ -758,6 +841,28 @@ function ToastProvider({ children }) {
 const useToast = () => React.useContext(ToastCtx);
 
 /* ============================================================
+   6-B) SyncWatcher — 서버 저장 실패 알림 + 재시도
+   ============================================================ */
+function SyncWatcher() {
+  const toast = useToast();
+  const lastToastRef = useRef(0);
+  useEffect(() => {
+    const onState = (e) => {
+      const d = (e && e.detail) || {};
+      if (d.ok !== false) return;
+      // 재시도마다 토스트가 쌓이지 않도록 30초에 한 번만 알린다
+      if (Date.now() - lastToastRef.current < 30000) return;
+      lastToastRef.current = Date.now();
+      toast(`서버 저장 실패 — 이 PC에는 남아 있습니다 (${d.error || '원인 불명'})`, 'error',
+        { duration: 9000, action: { label: '재시도', onClick: () => flushPendingWrites() } });
+    };
+    document.addEventListener(SYNC_EVT, onState);
+    return () => document.removeEventListener(SYNC_EVT, onState);
+  }, [toast]);
+  return null;
+}
+
+/* ============================================================
    7) Main App
    ============================================================ */
 function App() {
@@ -780,6 +885,29 @@ function App() {
   });
   const [lastSync, setLastSync] = useState(null);
   const [syncing, setSyncing] = useState(true);
+  const [pendingCount, setPendingCount] = useState(0);
+
+  // 서버 저장 실패분 자동 재시도 + 미저장 상태에서 이탈 경고
+  useEffect(() => {
+    const onState = (e) => setPendingCount(((e && e.detail) || {}).pending || 0);
+    document.addEventListener(SYNC_EVT, onState);
+    const retry = setInterval(() => { if (pendingWriteCount()) flushPendingWrites(); }, 20000);
+    const onOnline = () => { if (pendingWriteCount()) flushPendingWrites(); };
+    const onBeforeUnload = (e) => {
+      if (!hasUnsavedWork()) return;
+      e.preventDefault();
+      e.returnValue = ''; // 브라우저 기본 경고문 표시
+      return '';
+    };
+    window.addEventListener('online', onOnline);
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => {
+      document.removeEventListener(SYNC_EVT, onState);
+      clearInterval(retry);
+      window.removeEventListener('online', onOnline);
+      window.removeEventListener('beforeunload', onBeforeUnload);
+    };
+  }, []);
 
   // 초기 동기화 + 실시간 리스너
   useEffect(() => {
@@ -806,20 +934,10 @@ function App() {
       setSyncing(false);
       if (window.__fb && window.__fb.listen) {
         unsub = window.__fb.listen((d) => {
-          const out = {};
-          STORE_KEYS.forEach(k => {
-            if (d[k] !== undefined) {
-              try {
-                const parsed = typeof d[k] === 'string' ? JSON.parse(d[k]) : d[k];
-                out[k] = parsed;
-                localStorage.setItem('kpi_' + k, JSON.stringify(parsed));
-              } catch {}
-            }
-          });
-          if (Object.keys(out).length) {
-            setData(prev => ({ ...prev, ...out }));
-            setLastSync(new Date());
-          }
+          const out = pickChangedStore(d);
+          // 달라진 키가 있을 때만 state 교체 — 같은 내용이면 참조를 유지해 입력 중인 폼을 보호
+          if (Object.keys(out).length) setData(prev => ({ ...prev, ...out }));
+          setLastSync(new Date());
         });
       }
     })();
@@ -870,6 +988,7 @@ function App() {
   return (
     <ConfirmProvider>
     <ToastProvider>
+      <SyncWatcher />
       {syncing && (
         <div className="fixed top-0 left-0 right-0 h-0.5 z-[99999] bg-slate-200 overflow-hidden">
           <div className="h-full bg-indigo-500 shimmer" style={{width:'100%'}}></div>
@@ -879,7 +998,7 @@ function App() {
         <HomePage navigate={navigate} data={data} />
       ) : (
         <div className="min-h-screen flex flex-col">
-          <TopBar route={route} navigate={navigate} lastSync={lastSync} syncing={syncing} />
+          <TopBar route={route} navigate={navigate} lastSync={lastSync} syncing={syncing} pending={pendingCount} />
           <main className="flex-1 px-6 lg:px-10 py-6 max-w-[1600px] w-full mx-auto">
             {route === '/dashboard'           && <DashboardPage     data={data} />}
             {route === '/production'          && <ProductionPage    data={data} onSave={saveProduction} onSaveTrash={saveProductionTrash} onSaveJournal={saveWeeklyJournal} onSaveCatalog={saveProductCatalog} onSaveBunghalLog={saveBunghalLog} onSaveBunghalCorrections={saveBunghalCorrections} onSaveGeminiKey={saveGeminiApiKey} onSaveGeminiPassHash={saveGeminiPassHash} />}
@@ -910,7 +1029,7 @@ const PAGE_META = {
   '/quality/settings':    { title: '품질보증팀 목표 설정', sub: '월 누적 부적합·손실 상한 기준',     tag: 'QUALITY · SETTINGS',    accent: 'rose' },
 };
 
-function TopBar({ route, navigate, lastSync, syncing }) {
+function TopBar({ route, navigate, lastSync, syncing, pending = 0 }) {
   const meta = PAGE_META[route] || { title: '', sub: '', tag: '', accent: 'slate' };
   const [now, setNow] = useState(new Date());
   useEffect(() => {
@@ -979,6 +1098,8 @@ function TopBar({ route, navigate, lastSync, syncing }) {
                 <span className="relative inline-flex w-1.5 h-1.5">
                   {syncing ? (
                     <span className="relative w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse"></span>
+                  ) : pending ? (
+                    <span className="relative w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse"></span>
                   ) : (
                     <Fragment>
                       <span className="absolute inset-0 rounded-full bg-emerald-400 animate-pulse-ring"></span>
@@ -986,9 +1107,15 @@ function TopBar({ route, navigate, lastSync, syncing }) {
                     </Fragment>
                   )}
                 </span>
-                <span>{syncing ? '동기화 중…' : '동기화'}</span>
+                <span>{syncing ? '동기화 중…' : pending ? '저장 대기' : '동기화'}</span>
               </div>
-              <div className="num">{syncTime}</div>
+              {pending ? (
+                <button onClick={() => flushPendingWrites()}
+                  title="서버 저장에 실패한 항목이 있습니다. 눌러서 다시 시도하세요."
+                  className="num text-rose-600 font-bold hover:underline">{pending}건 재시도</button>
+              ) : (
+                <div className="num">{syncTime}</div>
+              )}
             </div>
           </div>
         </div>
@@ -3033,11 +3160,22 @@ function ProductionPage({ data, onSave, onSaveTrash, onSaveJournal, onSaveCatalo
   const [selectedDate, setSelectedDate] = useState(yesterday);
 
   const [tasks, setTasks] = useState(() => emptyTasks());
+  const tasksDirtyRef = useRef(false);     // 저장하지 않은 입력이 있는지
+  const lastLoadedDateRef = useRef(null);  // 마지막으로 불러온 일자
+
+  // 새로고침·창 닫기 경고에 이 화면의 미저장 여부를 등록
+  useEffect(() => registerDirtyCheck(() => tasksDirtyRef.current), []);
 
   const findExisting = (list, dateKey) => (list || []).find(e => e.date === dateKey);
 
   // 일자 변경 / 데이터 변경 시 — 그 일자 entry 로드 + 비어있는 task3/progressThis는 같은 주 다른 entry에서 carry-forward
+  // 주의: data.production은 봉탈 일지 저장(syncDailyKpiFromBunghal)·원격 동기화로도 바뀐다.
+  //       일자를 직접 바꾼 게 아니면서 입력 중이면 폼을 덮어쓰지 않는다.
   useEffect(() => {
+    const dateChanged = lastLoadedDateRef.current !== selectedDate;
+    if (!dateChanged && tasksDirtyRef.current) return;
+    lastLoadedDateRef.current = selectedDate;
+    if (dateChanged) tasksDirtyRef.current = false;
     const ex = findExisting(data.production, selectedDate);
     const baseTasks = ex && ex.tasks ? { ...emptyTasks(), ...ex.tasks } : emptyTasks();
 
@@ -3093,6 +3231,7 @@ function ProductionPage({ data, onSave, onSaveTrash, onSaveJournal, onSaveCatalo
   const existing = findExisting(data.production, selectedDate);
 
   const updateTask = (procKey, taskKey, field, value) => {
+    tasksDirtyRef.current = true;
     setTasks(prev => ({
       ...prev,
       [procKey]: {
@@ -3107,7 +3246,7 @@ function ProductionPage({ data, onSave, onSaveTrash, onSaveJournal, onSaveCatalo
     const owner = localStorage.getItem('kpi_owner_prod') || '';
     const selIso = getISOWeek(selectedDate);
     const entry = {
-      id: existing?.id || crypto.randomUUID(),
+      id: existing?.id || uuid(),
       date: selectedDate,
       year: selIso.year, week: selIso.week,
       weekKey: `${selIso.year}-W${pad2(selIso.week)}`,
@@ -3121,6 +3260,7 @@ function ProductionPage({ data, onSave, onSaveTrash, onSaveJournal, onSaveCatalo
     const idx = (data.production || []).findIndex(e => e.date === selectedDate);
     if (idx >= 0) { next = [...data.production]; next[idx] = entry; }
     else          { next = [...(data.production || []), entry]; }
+    tasksDirtyRef.current = false;
     onSave(next);
     toast(existing ? '수정 저장 완료' : '신규 저장 완료', 'success');
   };
@@ -3157,8 +3297,9 @@ function ProductionPage({ data, onSave, onSaveTrash, onSaveJournal, onSaveCatalo
       {tab === 'input'   && <ProductionInputTab   tasks={tasks} updateTask={updateTask} />}
       {tab === 'journal' && <WeeklyJournalTab     data={data} onSaveJournal={onSaveJournal} />}
       {tab === 'summary' && <ProductionSummaryTab data={data} />}
-      {tab === 'bunghalRecord' && <BunghalAnalysisTab mode="record"   data={data} onSave={onSave} onSaveLog={onSaveBunghalLog} onSaveCatalog={onSaveCatalog} onSaveCorrections={onSaveBunghalCorrections} onSaveGeminiKey={onSaveGeminiKey} onSaveGeminiPassHash={onSaveGeminiPassHash} />}
-      {tab === 'bunghal'       && <BunghalAnalysisTab mode="analysis" data={data} onSave={onSave} onSaveLog={onSaveBunghalLog} onSaveCatalog={onSaveCatalog} onSaveCorrections={onSaveBunghalCorrections} onSaveGeminiKey={onSaveGeminiKey} onSaveGeminiPassHash={onSaveGeminiPassHash} />}
+      {/* 기록·분석은 같은 컴포넌트를 mode만 바꿔 재사용 — 같은 JSX 위치를 유지해야 탭을 오가도 입력 중인 표가 살아남는다 */}
+      {(tab === 'bunghalRecord' || tab === 'bunghal') &&
+        <BunghalAnalysisTab mode={tab === 'bunghalRecord' ? 'record' : 'analysis'} data={data} onSave={onSave} onSaveLog={onSaveBunghalLog} onSaveCatalog={onSaveCatalog} onSaveCorrections={onSaveBunghalCorrections} onSaveGeminiKey={onSaveGeminiKey} onSaveGeminiPassHash={onSaveGeminiPassHash} />}
       {tab === 'history' && <ProductionHistoryTab data={data} onSave={onSave} onSaveTrash={onSaveTrash} />}
     </div>
   );
@@ -3904,11 +4045,43 @@ function KpiMatrix({ reports, targets, period, selectedDay, selectedWeek, select
    22-B2) BUNGHAL ANALYSIS TAB — 봉탈 집중 분석 (퀼팅·인터)
    ============================================================ */
 function makeEmptyBunghalRecord() {
-  return { _id: crypto.randomUUID(), product: '', size: '', position: '', qty: '', cause: '', originProc: '', action: '' };
+  return { _id: uuid(), product: '', size: '', position: '', qty: '', cause: '', originProc: '', action: '' };
 }
 
 function makeEmptyProductionRecord() {
-  return { _id: crypto.randomUUID(), product: '', size: '', position: '', qty: '', time: '' };
+  return { _id: uuid(), product: '', size: '', position: '', qty: '', time: '' };
+}
+
+// 봉탈 입력 임시저장 — 탭 전환·새로고침·브라우저 종료에도 입력이 남도록
+const BUNGHAL_DRAFT_KEY = 'kpi_draft_bunghal';
+const BUNGHAL_DRAFT_TTL_MS = 3 * 24 * 60 * 60 * 1000; // 3일 지나면 폐기
+
+function readBunghalDraft() {
+  try {
+    const raw = localStorage.getItem(BUNGHAL_DRAFT_KEY);
+    if (!raw) return null;
+    const d = JSON.parse(raw);
+    if (!d || !d.savedAt) return null;
+    if (Date.now() - new Date(d.savedAt).getTime() > BUNGHAL_DRAFT_TTL_MS) {
+      localStorage.removeItem(BUNGHAL_DRAFT_KEY);
+      return null;
+    }
+    return d;
+  } catch { return null; }
+}
+function writeBunghalDraft(d) {
+  try { localStorage.setItem(BUNGHAL_DRAFT_KEY, JSON.stringify({ ...d, savedAt: new Date().toISOString() })); } catch {}
+}
+function clearBunghalDraft() {
+  try { localStorage.removeItem(BUNGHAL_DRAFT_KEY); } catch {}
+}
+
+// 행에 입력된 내용이 있는지 — 자동 행 추가 판정용
+function rowHasContent(r) {
+  if (!r) return false;
+  if ((Number(r.qty) || 0) > 0) return true;
+  return ['product', 'size', 'position', 'cause', 'originProc', 'action', 'time']
+    .some(k => String(r[k] || '').trim());
 }
 
 // 인식된 작업자명을 catalog.owners 목록 중 가장 가까운 이름으로 교정 (편집거리 ≤ 2)
@@ -3934,6 +4107,10 @@ function snapToKnownOwner(raw, owners) {
 
 // 비밀번호 해시 (Web Crypto API의 SHA-256)
 async function sha256Hex(text) {
+  if (!(typeof crypto !== 'undefined' && crypto.subtle)) {
+    // Web Crypto의 subtle은 HTTPS·localhost에서만 제공된다
+    throw new Error('비밀번호 기능은 HTTPS 또는 localhost 접속에서만 사용할 수 있습니다');
+  }
   const buf = new TextEncoder().encode(text);
   const h = await crypto.subtle.digest('SHA-256', buf);
   return Array.from(new Uint8Array(h)).map(b => b.toString(16).padStart(2, '0')).join('');
@@ -4286,6 +4463,23 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
   const pasteRef = useRef(null);
   const fileRef  = useRef(null);
   const skipReloadRef = useRef(false);  // 인식 후 헤더 자동 갱신 시 useEffect의 reset 건너뛰기
+  const inputDirtyRef = useRef(false);   // 사용자가 입력 표를 직접 손댔는지 — 동기화가 덮어쓰지 못하게 함
+  const lastLoadedKeyRef = useRef(null); // 마지막으로 불러온 '일자|작업자' 키
+  const draftNotifiedRef = useRef(false); // 임시저장 복원 안내를 한 번만 띄우기 위함
+
+  // 새로고침·창 닫기 경고에 이 화면의 미저장 여부를 등록
+  useEffect(() => registerDirtyCheck(() => inputDirtyRef.current), []);
+
+  // 입력 중인 내용을 계속 임시저장 — 탭을 옮기거나 새로고침해도 복원된다
+  useEffect(() => {
+    if (!inputDirtyRef.current) return;
+    writeBunghalDraft({
+      date: inputDate,
+      owner: (inputOwner || '').trim(),
+      records: inputRecords,
+      productionRecords,
+    });
+  }, [inputDate, inputOwner, inputRecords, productionRecords]);
 
   const hasPassword = !!data.geminiPassHash;
 
@@ -4320,7 +4514,9 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
   const handleSetPassword = async () => {
     if (passInput.length < 4) { setPassError('비밀번호는 최소 4자 이상'); return; }
     if (passInput !== passInput2) { setPassError('비밀번호가 일치하지 않습니다'); return; }
-    const hash = await sha256Hex(passInput);
+    let hash;
+    try { hash = await sha256Hex(passInput); }
+    catch (e) { setPassError(e.message); return; }
     onSaveGeminiPassHash && onSaveGeminiPassHash(hash);
     setKeyUnlocked(true);
     setKeyPassMode(null);
@@ -4329,7 +4525,9 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
   };
 
   const handleVerifyPassword = async () => {
-    const hash = await sha256Hex(passInput);
+    let hash;
+    try { hash = await sha256Hex(passInput); }
+    catch (e) { setPassError(e.message); return; }
     if (hash === (data.geminiPassHash || '')) {
       setKeyUnlocked(true);
       setKeyPassMode(null);
@@ -4421,7 +4619,7 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
           cause = cause.replace(/\s*[\(\[]?\s*수선건?\s*[\)\]]?\s*/g, '').trim();
         }
         return {
-          _id: crypto.randomUUID(),
+          _id: uuid(),
           product:    String(r.product || '').trim(),
           size:       String(r.size || '').trim().toUpperCase(),
           position:   String(r.position || '').trim() || '상',
@@ -4432,13 +4630,14 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
         };
       });
       const prodRecs = prodArr.map(r => ({
-        _id: crypto.randomUUID(),
+        _id: uuid(),
         product:  String(r.product || '').trim(),
         size:     String(r.size || '').trim().toUpperCase(),
         position: String(r.position || '').trim() || '상',
         qty:      Number(r.qty) || 0,
         time:     String(r.time || '').trim(),
       }));
+      inputDirtyRef.current = false; // 인식 결과는 사용자 입력이 아님 — originalRecords 가드가 보호
       setInputRecords(defectRecords.length ? defectRecords : [makeEmptyBunghalRecord()]);
       setProductionRecords(prodRecs.length ? prodRecs : [makeEmptyProductionRecord()]);
       setOriginalRecords(defectRecords.map(r => ({ ...r })));
@@ -4470,11 +4669,32 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
   };
 
   // 일자·작업자 변경 시 — 그 일자+작업자 entry 있으면 로드 (date+owner unique key)
+  // 주의: bunghalLog는 서버 동기화로도 바뀌므로, 입력 중(inputDirtyRef)이면 덮어쓰지 않는다.
   useEffect(() => {
-    if (skipReloadRef.current) { skipReloadRef.current = false; return; }
-    if (editingEntryId) return;
+    const key = `${inputDate}|${(inputOwner || '').trim()}`;
+    const keyChanged = lastLoadedKeyRef.current !== key;
+    if (skipReloadRef.current) { skipReloadRef.current = false; lastLoadedKeyRef.current = key; return; }
+    if (editingEntryId) { lastLoadedKeyRef.current = key; return; }
     if (originalRecords.length) return; // 인식 직후 — 저장 전까지 records 보호
+    // 일자·작업자는 그대로인데 동기화로 bunghalLog만 바뀐 경우 — 입력 중이면 표를 건드리지 않음
+    if (!keyChanged && inputDirtyRef.current) return;
+    lastLoadedKeyRef.current = key;
+    if (keyChanged) inputDirtyRef.current = false; // 헤더를 직접 바꾼 것이므로 새 entry 기준으로 초기화
     const ex = bunghalLog.find(e => e.date === inputDate && (e.owner || '') === (inputOwner || '').trim());
+    // 임시저장본이 같은 일자·작업자이고 저장본보다 나중이면 그쪽을 복원한다
+    const draft = readBunghalDraft();
+    const draftFits = draft && draft.date === inputDate && (draft.owner || '') === (inputOwner || '').trim();
+    const draftNewer = draftFits && (!ex || !ex.updatedAt || new Date(draft.savedAt) > new Date(ex.updatedAt));
+    if (draftNewer) {
+      inputDirtyRef.current = true;
+      setInputRecords(draft.records && draft.records.length ? draft.records : [makeEmptyBunghalRecord()]);
+      setProductionRecords(draft.productionRecords && draft.productionRecords.length ? draft.productionRecords : [makeEmptyProductionRecord()]);
+      if (!draftNotifiedRef.current) {
+        draftNotifiedRef.current = true;
+        toast('저장하지 않은 입력을 복원했습니다', 'info');
+      }
+      return;
+    }
     setInputRecords(ex && ex.records ? ex.records : [makeEmptyBunghalRecord()]);
     setProductionRecords(ex && ex.productionRecords ? ex.productionRecords : [makeEmptyProductionRecord()]);
   }, [inputDate, inputOwner, bunghalLog, originalRecords]); // editingEntryId는 의도적으로 deps 제외
@@ -4500,13 +4720,30 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
     toast('작업자 목록 저장 완료', 'success');
   };
 
-  const addRecord = () => setInputRecords(rs => [...rs, makeEmptyBunghalRecord()]);
-  const updateRecord = (idx, field, val) => setInputRecords(rs => rs.map((r, i) => i === idx ? { ...r, [field]: val } : r));
-  const removeRecord = (idx) => setInputRecords(rs => rs.filter((_, i) => i !== idx));
+  const markInputDirty = () => { inputDirtyRef.current = true; };
 
-  const addProdRecord = () => setProductionRecords(rs => [...rs, makeEmptyProductionRecord()]);
-  const updateProdRecord = (idx, field, val) => setProductionRecords(rs => rs.map((r, i) => i === idx ? { ...r, [field]: val } : r));
-  const removeProdRecord = (idx) => setProductionRecords(rs => rs.filter((_, i) => i !== idx));
+  const addRecord = () => { markInputDirty(); setInputRecords(rs => [...rs, makeEmptyBunghalRecord()]); };
+  const updateRecord = (idx, field, val) => {
+    markInputDirty();
+    setInputRecords(rs => {
+      const next = rs.map((r, i) => i === idx ? { ...r, [field]: val } : r);
+      // 마지막 행에 내용이 생기면 빈 행을 자동으로 하나 덧붙인다
+      if (idx === next.length - 1 && rowHasContent(next[idx])) next.push(makeEmptyBunghalRecord());
+      return next;
+    });
+  };
+  const removeRecord = (idx) => { markInputDirty(); setInputRecords(rs => rs.filter((_, i) => i !== idx)); };
+
+  const addProdRecord = () => { markInputDirty(); setProductionRecords(rs => [...rs, makeEmptyProductionRecord()]); };
+  const updateProdRecord = (idx, field, val) => {
+    markInputDirty();
+    setProductionRecords(rs => {
+      const next = rs.map((r, i) => i === idx ? { ...r, [field]: val } : r);
+      if (idx === next.length - 1 && rowHasContent(next[idx])) next.push(makeEmptyProductionRecord());
+      return next;
+    });
+  };
+  const removeProdRecord = (idx) => { markInputDirty(); setProductionRecords(rs => rs.filter((_, i) => i !== idx)); };
 
   const saveBunghalEntry = () => {
     if (!inputOwner.trim() || !(catalog.owners || []).includes(inputOwner.trim())) {
@@ -4525,7 +4762,7 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
       ? bunghalLog.find(e => e.id === editingEntryId)
       : bunghalLog.find(e => e.date === inputDate && (e.owner || '') === (inputOwner || '').trim());
     const entry = {
-      id: existing?.id || crypto.randomUUID(),
+      id: existing?.id || uuid(),
       date: inputDate,
       owner: inputOwner || '',
       records: valid,
@@ -4537,6 +4774,8 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
       ? bunghalLog.map(e => e.id === existing.id ? entry : e)
       : [...bunghalLog, entry];
     setEditingEntryId(null);
+    inputDirtyRef.current = false;
+    clearBunghalDraft();
     onSaveLog(next);
 
     // 자가 학습 — 인식 직후 originalRecords와 현재 inputRecords의 차이를 누적
@@ -4605,7 +4844,7 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
     };
     const flat = tasksToFlatKpis(baseTasks);
     const entry = {
-      id: existingProd?.id || crypto.randomUUID(),
+      id: existingProd?.id || uuid(),
       date,
       year: selIso.year, week: selIso.week,
       weekKey: `${selIso.year}-W${pad2(selIso.week)}`,
@@ -4630,6 +4869,8 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
     const next = bunghalLog.filter(e => e.id !== existing.id);
     setEditingEntryId(null);
     onSaveLog(next);
+    inputDirtyRef.current = false;
+    clearBunghalDraft();
     setInputRecords([makeEmptyBunghalRecord()]);
     setProductionRecords([makeEmptyProductionRecord()]);
     setOriginalRecords([]);
@@ -4652,6 +4893,9 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
     setInputDate(entry.date);
     setInputOwner(entry.owner || '');
     // records를 직접 로드 (useEffect가 editingEntryId 때문에 skip하므로)
+    inputDirtyRef.current = false;
+    clearBunghalDraft();
+    lastLoadedKeyRef.current = `${entry.date}|${(entry.owner || '').trim()}`;
     setInputRecords(entry.records?.length ? entry.records : [makeEmptyBunghalRecord()]);
     setProductionRecords(entry.productionRecords?.length ? entry.productionRecords : [makeEmptyProductionRecord()]);
     setInputOpen(true);
@@ -6206,7 +6450,7 @@ function ErpReportTab({ data, onSaveErp }) {
       const dates = [...groups.keys()].sort();
       const now = new Date().toISOString();
       const newEntries = dates.map(date => ({
-        id: crypto.randomUUID(),
+        id: uuid(),
         reportDate: date,
         filename: file.name,
         source: 'erp',
@@ -6214,7 +6458,7 @@ function ErpReportTab({ data, onSaveErp }) {
         updatedAt: now,
         processIncidents: { '2F': 0, '4F': 0, 'OUT': 0 },
         inputQty:         { '2F': null, '4F': null, 'OUT': null },
-        records: groups.get(date).map((r, i) => ({ ...r, _id: crypto.randomUUID(), no: r.no || (i+1) })),
+        records: groups.get(date).map((r, i) => ({ ...r, _id: uuid(), no: r.no || (i+1) })),
       }));
       // 같은 발생일 데이터는 새 파일로 통째로 대체 (파일명 무관)
       const newDates = new Set(newEntries.map(e => e.reportDate));
