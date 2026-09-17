@@ -639,13 +639,40 @@ function getAchievement(kpiKey, value, targets) {
    ============================================================ */
 const STORE_KEYS = ['production', 'quality', 'targets', 'qualityTargets', 'erpReports', 'priceMaster', 'erpTrash', 'productionTrash', 'weeklyJournal', 'productCatalog', 'bunghalLog', 'bunghalCorrections', 'geminiApiKey', 'geminiPassHash'];
 
+// 표기 통일 — 같은 불량이 여러 표기로 쪼개지는 것을 막는다.
+// 값 전체가 정확히 일치할 때만 치환한다 (부분 치환은 "데일리라이트"→"데일리데일리라이트" 같은 사고를 낸다)
+const BASE_CAUSE_ALIASES = {
+  '스펀지접힘': '스펀지 접힘',
+  '패턴접힘':   '패턴 접힘',
+  '패딩접힘':   '패딩 접힘',
+  '사이즈미달': '사이즈 미달',
+  '사이즈이단': '사이즈 미달',
+  '미달':       '사이즈 미달',
+  '원단스팟':   '원단 스팟',
+  '워던스팟':   '원단 스팟',
+  '수선불량':   '수선 불량',
+  '구멍':       '원단구멍',
+  '바늘구멍':   '원단구멍',
+  '오영':       '오염',
+};
+const BASE_PRODUCT_ALIASES = {
+  '라이트':      '데일리라이트',
+  '데일리 키즈': '키즈',
+};
+// 저장된 기록에서 이 횟수 이상 쓰인 값은 인식 사전에 자동 편입된다.
+// 사람이 검수해 저장한 값이므로 신뢰할 수 있는 기준.
+const CATALOG_AUTO_MIN_COUNT = 2;
+
 // 봉탈 분석용 품목 사전 — 사용자가 수정 가능
 const DEFAULT_PRODUCT_CATALOG = {
-  products:  ['이브닝', '쿠시노', '데일리', '데일리라이트', '뉴문', '하프문', '풀문', '문레이', '선셋', '선라이즈', '시그니처', '키즈'],
+  products:  ['이브닝', '이브닝 모션', '쿠시노', '데일리', '데일리라이트', '뉴문', '하프문', '풀문', '문레이', '선셋', '선라이즈', '시그니처', '키즈', '스타릿', '코코', '누크'],
   sizes:     ['S', 'SS', 'D', 'Q', 'K', 'KK'],
   positions: ['최상단', '상', '하'],
   aliases:   { '라이트': '데일리라이트' },
-  causes:    ['봉탈', '재작업 부족', '스펀지 접힘', '원단 부족(수선)', '오염', '이물', '기타'],
+  causes:    ['봉탈', '오염', '스펀지 접힘', '사이즈 미달', '이음부', '재직불량', '원단구멍',
+              '패턴 접힘', '올나감', '잡사', '원단불량', '재단불량', '패턴불량', '원단 스팟',
+              '재단접힘', '수선 불량', '재단미달', '원단접힘', '스펀지 찢김', '원단밀림',
+              '패딩 접힘', '재작업 부족', '원단 부족(수선)', '이물', '기타'],
   origins:   ['퀼팅', '인터', '업체', '수선'],
   actions:   ['수선', '폐기'],
   owners:    ['인터 #1', '인터 #2'],
@@ -4117,15 +4144,68 @@ async function sha256Hex(text) {
 }
 
 // 품목 표기 정규화 — "데일리SS상" 같은 자유 입력을 catalog에 fuzzy match
-function normalizeProductName(raw, catalog) {
+function applyAlias(raw, map) {
   const s = String(raw || '').trim();
-  if (!s) return s;
-  // alias 직접 치환
-  let out = s;
-  Object.entries(catalog.aliases || {}).forEach(([from, to]) => {
-    out = out.replace(new RegExp(from, 'g'), to);
+  return (s && map && map[s]) ? map[s] : s;
+}
+
+function normalizeProductName(raw, catalog) {
+  return applyAlias(raw, { ...BASE_PRODUCT_ALIASES, ...((catalog && catalog.aliases) || {}) });
+}
+
+function normalizeCauseName(raw, catalog) {
+  return applyAlias(raw, { ...BASE_CAUSE_ALIASES, ...((catalog && catalog.causeAliases) || {}) });
+}
+
+// 실제 저장된 작업일지에서 자주 쓰인 값을 인식 사전에 자동 편입한다.
+// 신제품·신규 불량이 나와도 두 번 저장되면 그 다음 인식부터 사전에 포함되므로,
+// 사전을 손으로 관리하지 않아도 현실과 벌어지지 않는다.
+function effectiveCatalog(catalog, bunghalLog, minCount = CATALOG_AUTO_MIN_COUNT) {
+  const base = catalog || DEFAULT_PRODUCT_CATALOG;
+  const prodTally = {};
+  const causeTally = {};
+  const bump = (m, v) => { if (v) m[v] = (m[v] || 0) + 1; };
+  (bunghalLog || []).forEach(e => {
+    (e.records || []).forEach(r => {
+      bump(prodTally, normalizeProductName(r.product, base));
+      bump(causeTally, normalizeCauseName(r.cause, base));
+    });
+    (e.productionRecords || []).forEach(r => bump(prodTally, normalizeProductName(r.product, base)));
   });
-  return out;
+  const frequent = (m) => Object.keys(m).filter(k => m[k] >= minCount);
+  const union = (a, b) => [...new Set([...(a || []), ...b])];
+  // 품목 칸에 메모가 섞인 값("키즈(수선)")이나 품목이 아닌 값은 자동 편입에서 제외
+  const looksLikeProduct = (v) => v.length <= 12 && !/[()\[\]\/]/.test(v) && !/^(샘플|기타)$/.test(v);
+  return {
+    ...base,
+    products: union(base.products, frequent(prodTally).filter(looksLikeProduct)),
+    causes:   union(base.causes,   frequent(causeTally)),
+  };
+}
+
+// 프롬프트에 넣을 교정만 추린다.
+// - 이미 사전에 있는 정상값을 "틀렸다"고 표시한 항목은 글자 오인식이 아니라 판단 변경이므로 제외.
+//   (행 밀림으로 생긴 "수선"→"폐기" 같은 가짜 교정이 여기서 걸러진다)
+// - 자유 텍스트인 품목·원인만 학습 대상. 사이즈·위치·공정·처리는 실제 데이터가 100% 사전 값이라 배울 것이 없다.
+function usefulCorrections(corrections, cat) {
+  const vocab = {
+    product: new Set((cat && cat.products) || []),
+    cause:   new Set((cat && cat.causes) || []),
+  };
+  const seen = new Set();
+  const out = [];
+  (corrections || []).forEach(c => {
+    if (!vocab[c.field]) return;
+    const w = String(c.wrong || '').trim();
+    const r = String(c.correct || '').trim();
+    if (!w || !r || w === r) return;
+    if (vocab[c.field].has(w)) return;
+    const k = `${c.field}:${w}→${r}`;
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push(c);
+  });
+  return out.slice(-30);
 }
 
 // 이미지 압축 — 최대 1500px, JPEG 85% (OCR 품질 유지하면서 전송 크기 축소)
@@ -4188,9 +4268,21 @@ function buildBunghalPrompt(catalog, corrections) {
 ${aliasStr}
 
 [축약 규칙 — 매우 중요 · 두 표 모두 적용]
-- 셀이 "(따옴표) 또는 〃 또는 빈칸 = 위 행의 *전체 값* 그대로 복사
+- 셀에 따옴표(") 또는 〃 가 *실제로 적혀 있을 때만* 위 행의 값을 복사
 - "S, "SS, "K처럼 따옴표 뒤 알파벳 = 위 행의 *품목명* 유지 + 새 사이즈
 - 따옴표 뒤 한글(상/하) = 위 행의 *품목명·사이즈* 유지 + 새 위치
+- 셀이 그냥 비어 있으면 *복사하지 말고 빈 문자열로 둘 것*. 빈칸은 축약 기호가 아님
+
+[행 독립 판단 — 매우 중요]
+- 각 행의 원인·품목·처리내역은 *그 행에 실제로 적힌 글자만* 보고 판단
+- 앞 행에서 같은 값을 읽었다는 이유로 다음 행을 같은 값으로 채우지 말 것
+- 위 축약 기호(" 〃)가 명시적으로 있을 때만 복사
+- 글자가 흐려 확신이 없으면 앞 행 값을 추측해서 쓰지 말고 보이는 대로 적을 것
+
+[중복 행 금지]
+- 같은 품목·사이즈·위치·수량·원인이 연속으로 두 번 나오는 일은 드묾
+- 같은 내용을 두 행으로 만들기 전에 사진에 실제로 두 줄이 있는지 확인할 것
+- 사진에 있는 줄 수보다 많은 행을 만들지 말 것
 
 [작업시간 블록 규칙 — 매우 중요]
 작업시간은 여러 행이 하나의 블록을 공유할 수 있습니다.
@@ -4200,6 +4292,8 @@ ${aliasStr}
 - 예시: 행2에 "13:00 -", 행3·4·5에 시간 없음, 행6에 "17:05" → 행2~6 모두 time = "13:00-17:05"
 - "HH:MM - HH:MM" 처럼 한 셀에 시작~종료가 모두 있으면 그대로 해당 행에만 적용
 - 블록 도중 중간 시간(예: "15:20", "15:40")이 있어도 그 행도 해당 블록의 time을 유지
+- 작업시간 칸에 시간만 적혀 있고 품목·수량이 비어 있는 줄은 *블록의 종료시간 표시*이며
+  독립된 데이터 행이 아님. 이런 줄을 production 배열의 행으로 만들지 말 것
 
 [위치 기본값 규칙]
 - "최상단", "상", "하" 중 하나가 *명확히 적혀있지 않으면* position을 "상"으로 채움
@@ -4209,7 +4303,9 @@ ${aliasStr}
 - 예: "원단구멍 (수선건)" → cause: "원단구멍", originProc: "수선"
 - cause 필드에서는 괄호 부분·"수선"/"수선건" 표현을 제거하여 *순수 원인*만 남김
 
-[이전 오인식 — 같은 오류 반복 금지]
+[이전 오인식 — 글자 모양이 비슷해 헷갈렸던 사례]
+아래는 *글자를 잘못 읽었던* 사례입니다. 비슷한 글자꼴이 보일 때만 참고하십시오.
+사진에 명확히 다른 글자가 적혀 있으면 아래 목록보다 *사진을 우선*합니다.
 ${corrStr}
 
 [작업일지 메타정보]
@@ -4579,8 +4675,10 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
     try {
       const base64 = photoDataUrl.split(',')[1];
       const mimeType = photoDataUrl.match(/^data:(.+);base64/)?.[1] || 'image/png';
-      const corrections = (data.bunghalCorrections || []).slice(-30); // 최근 30개만
-      const prompt = buildBunghalPrompt(catalog, corrections);
+      // 저장된 기록으로 보강한 사전 + 오인식으로 판단되는 교정만 사용
+      const recogCatalog = effectiveCatalog(catalog, bunghalLog);
+      const corrections = usefulCorrections(data.bunghalCorrections, recogCatalog);
+      const prompt = buildBunghalPrompt(recogCatalog, corrections);
       const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -4620,18 +4718,18 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
         }
         return {
           _id: uuid(),
-          product:    String(r.product || '').trim(),
+          product:    normalizeProductName(r.product, catalog),
           size:       String(r.size || '').trim().toUpperCase(),
           position:   String(r.position || '').trim() || '상',
           qty:        Number(r.qty) || 0,
-          cause,
+          cause:      normalizeCauseName(cause, catalog),
           originProc,
           action:     String(r.action || '').trim(),
         };
       });
       const prodRecs = prodArr.map(r => ({
         _id: uuid(),
-        product:  String(r.product || '').trim(),
+        product:  normalizeProductName(r.product, catalog),
         size:     String(r.size || '').trim().toUpperCase(),
         position: String(r.position || '').trim() || '상',
         qty:      Number(r.qty) || 0,
@@ -4720,6 +4818,32 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
     toast('작업자 목록 저장 완료', 'success');
   };
 
+  // 저장된 기록으로 보강한 사전 — 자동완성과 인식에 함께 쓴다
+  const liveCatalog = useMemo(() => effectiveCatalog(catalog, bunghalLog), [catalog, bunghalLog]);
+
+  // 내용이 완전히 같은 행 — Gemini의 이중등록을 잡아낸다
+  const duplicateRows = useMemo(() => {
+    const FIELDS = ['product', 'size', 'position', 'qty', 'cause', 'originProc', 'action'];
+    const first = new Map();
+    const dup = new Set();
+    inputRecords.forEach((r, i) => {
+      const parts = FIELDS.map(f => String(r[f] ?? '').trim());
+      if (!parts.some(Boolean)) return;
+      const k = parts.join('|');
+      if (first.has(k)) dup.add(i); else first.set(k, i);
+    });
+    return dup;
+  }, [inputRecords]);
+
+  // 학습(교정) 데이터 초기화 — 오염된 교정은 선별이 어려워 통째로 비우는 편이 낫다
+  const resetCorrections = async () => {
+    const n = (data.bunghalCorrections || []).length;
+    if (!n) { toast('저장된 학습 데이터가 없습니다', 'info'); return; }
+    if (!await dialog(`사진 인식 학습 데이터 ${n}건을 모두 지울까요?\n\n지운 뒤에는 앞으로의 수정 내용만 다시 쌓입니다.\n작업일지 기록은 지워지지 않습니다.`)) return;
+    onSaveCorrections && onSaveCorrections([]);
+    toast(`학습 데이터 ${n}건 초기화 완료`, 'success');
+  };
+
   const markInputDirty = () => { inputDirtyRef.current = true; };
 
   const addRecord = () => { markInputDirty(); setInputRecords(rs => [...rs, makeEmptyBunghalRecord()]); };
@@ -4757,6 +4881,34 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
       (r.product || '').trim() || (Number(r.qty) || 0) > 0
     );
     if (!valid.length && !validProd.length) { toast('입력된 record가 없습니다', 'warn'); return; }
+
+    // 인식 정확도 계측 — 사진 인식 결과 대비 사람이 얼마나 고쳤는지 entry에 남긴다.
+    // 별도 저장 키를 만들지 않고 작업일지에 함께 실어 두면 나중에 그대로 집계할 수 있다.
+    const STAT_FIELDS = ['product', 'size', 'position', 'qty', 'cause', 'originProc', 'action'];
+    let recogStats = null;
+    if (originalRecords.length) {
+      const origById = new Map(originalRecords.map(r => [r._id, r]));
+      let kept = 0, changedCells = 0, changedRows = 0;
+      valid.forEach(cur => {
+        const o = origById.get(cur._id);
+        if (!o) return;
+        kept++;
+        const n = STAT_FIELDS.filter(f =>
+          String(o[f] ?? '').trim() !== String(cur[f] ?? '').trim()).length;
+        changedCells += n;
+        if (n) changedRows++;
+      });
+      recogStats = {
+        recognized:   originalRecords.length,
+        kept,
+        removed:      originalRecords.length - kept,
+        added:        valid.filter(r => !origById.has(r._id)).length,
+        changedRows,
+        changedCells,
+        cells:        kept * STAT_FIELDS.length,
+      };
+    }
+
     // 편집 모드면 ID로 조회, 아니면 date+owner 조합으로 조회
     const existing = editingEntryId
       ? bunghalLog.find(e => e.id === editingEntryId)
@@ -4769,6 +4921,7 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
       productionRecords: validProd,
       createdAt: existing?.createdAt || new Date().toISOString(),
       updatedAt: new Date().toISOString(),
+      ...(recogStats ? { recogStats } : {}),
     };
     const next = existing
       ? bunghalLog.map(e => e.id === existing.id ? entry : e)
@@ -4778,14 +4931,19 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
     clearBunghalDraft();
     onSaveLog(next);
 
-    // 자가 학습 — 인식 직후 originalRecords와 현재 inputRecords의 차이를 누적
+    // 자가 학습 — 인식 결과와 사람이 고친 결과의 차이를 누적.
+    // 짝은 반드시 _id로 맞춘다. 인덱스로 맞추면 사용자가 행을 하나만 지워도 이후 행이 전부 밀려
+    // "수선"→"폐기" 같은 가짜 교정이 대량 생성되고, 그게 다음 인식 프롬프트를 오염시킨다.
     if (originalRecords.length && onSaveCorrections) {
+      const origById = new Map(originalRecords.map(r => [r._id, r]));
       const diffs = [];
       const seen = new Set();
-      inputRecords.forEach((cur, i) => {
-        const orig = originalRecords[i];
-        if (!orig) return;
-        ['product', 'size', 'position', 'cause', 'originProc', 'action'].forEach(field => {
+      inputRecords.forEach(cur => {
+        const orig = origById.get(cur._id);
+        if (!orig) return; // 사용자가 새로 추가한 행 — 비교 대상 없음
+        // 품목·원인만 학습한다. 사이즈·위치·공정·처리는 인식 결과가 항상 사전 값이라
+        // 값이 달라졌다면 글자 오인식이 아니라 사람의 판단 변경이다.
+        ['product', 'cause'].forEach(field => {
           const o = String(orig[field] || '').trim();
           const c = String(cur[field] || '').trim();
           if (o && c && o !== c && !seen.has(`${field}:${o}→${c}`)) {
@@ -5419,6 +5577,11 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
                   </button>
                   <input ref={fileRef} type="file" accept="image/*" className="hidden"
                     onChange={e => { const f = e.target.files?.[0]; if (f) onPickFile(f); e.target.value = ''; }} />
+                  <button onClick={resetCorrections}
+                    title="인식 결과를 고친 내용이 학습 데이터로 쌓입니다. 인식이 계속 엉뚱하면 초기화하세요."
+                    className="text-[11px] px-2 py-1 rounded text-slate-500 hover:bg-slate-100">
+                    학습 {(data.bunghalCorrections || []).length}건
+                  </button>
                   <button onClick={() => fileRef.current?.click()}
                     className="text-[11px] px-2 py-1 rounded text-slate-600 hover:bg-slate-100">파일 선택</button>
                   {photoDataUrl && (
@@ -5641,6 +5804,13 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
                 className="text-[10px] px-2 py-1 rounded text-rose-600 hover:bg-rose-50 font-semibold">+ 행 추가</button>
             </div>
 
+            {duplicateRows.size > 0 && (
+              <div className="mb-1.5 px-2.5 py-1.5 rounded-md bg-amber-50 border border-amber-200 text-[11px] text-amber-800 flex items-center gap-1.5">
+                <Icon name="shield" size={12} />
+                <span>내용이 완전히 같은 행이 {duplicateRows.size}개 있습니다 — 사진에 실제로 두 줄이 있는지 확인하세요 (아래 노란 행)</span>
+              </div>
+            )}
+
             {/* 부적합 record 표 */}
             <div className="overflow-x-auto border border-slate-200 rounded-lg">
               <table className="w-full text-xs">
@@ -5666,7 +5836,8 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
                     const emptyNum = (v) => empty(v) || Number(v) <= 0;
                     const cellCls = (isEmpty) => `w-full px-2 py-1 border rounded text-xs text-center focus:outline-none focus:ring-2 focus:ring-violet-300 focus:border-slate-200 ${isEmpty ? 'border-dashed border-rose-300 bg-rose-50/30' : 'border-transparent hover:border-slate-200'}`;
                     return (
-                      <tr key={r._id || i} className="border-t border-slate-100 hover:bg-violet-50/20">
+                      <tr key={r._id || i}
+                        className={`border-t border-slate-100 ${duplicateRows.has(i) ? 'bg-amber-50/70' : 'hover:bg-violet-50/20'}`}>
                         <td className="px-2 py-1 text-center text-slate-400 num">{i+1}</td>
                         <td className="px-1 py-1">
                           <input type="text" list="catalog-products" value={r.product || ''}
@@ -5730,10 +5901,10 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
             </div> {/* grid 끝 */}
 
             {/* datalist 자동완성 — catalog 기반 */}
-            <datalist id="catalog-products">{catalog.products.map(p => <option key={p} value={p} />)}</datalist>
+            <datalist id="catalog-products">{liveCatalog.products.map(p => <option key={p} value={p} />)}</datalist>
             <datalist id="catalog-sizes">{catalog.sizes.map(s => <option key={s} value={s} />)}</datalist>
             <datalist id="catalog-positions">{catalog.positions.map(p => <option key={p} value={p} />)}</datalist>
-            <datalist id="catalog-causes">{(catalog.causes || []).map(c => <option key={c} value={c} />)}</datalist>
+            <datalist id="catalog-causes">{(liveCatalog.causes || []).map(c => <option key={c} value={c} />)}</datalist>
             <datalist id="catalog-origins">{(catalog.origins || []).map(o => <option key={o} value={o} />)}</datalist>
             <datalist id="catalog-actions">{(catalog.actions || []).map(a => <option key={a} value={a} />)}</datalist>
           </div>
