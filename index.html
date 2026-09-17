@@ -5039,13 +5039,17 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveGemi
       (entry.records || []).forEach(r => {
         out.push({
           ...r,
+          // 공통코드의 표기 통일을 집계에도 적용한다.
+          // 저장된 값은 그대로 두고 분석에서만 합치므로, 과거 기록도 규칙을 추가한 즉시 합쳐진다.
+          product: normalizeProductName(r.product, catalog),
+          cause:   normalizeCauseName(r.cause, catalog),
           date: entry.date,
           owner: entry.owner,
         });
       });
     });
     return out;
-  }, [bunghalLog]);
+  }, [bunghalLog, catalog]);
 
   // bunghalLog → 생산 records 추출
   const productionRecordsAll = useMemo(() => {
@@ -5054,13 +5058,14 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveGemi
       (entry.productionRecords || []).forEach(r => {
         out.push({
           ...r,
+          product: normalizeProductName(r.product, catalog),
           date: entry.date,
           owner: entry.owner,
         });
       });
     });
     return out;
-  }, [bunghalLog]);
+  }, [bunghalLog, catalog]);
 
   // 2) 사용 가능한 일·주·월 + dataRange
   // bunghalRecords + productionRecordsAll 양쪽 날짜를 합산해야
@@ -8392,96 +8397,182 @@ function UploadGroupCard({ g, onDeleteGroup, onDeleteReport }) {
 /* ============================================================
    24-C) CODE MASTER — 공통코드 관리
    ============================================================ */
+// 저장된 작업일지에서 값별 사용 횟수를 센다 — 어떤 코드가 살아있고 죽었는지의 근거
+function tallyCodeUsage(bunghalLog) {
+  const m = {};
+  const bump = (k, v) => {
+    const s = String(v || '').trim();
+    if (!s) return;
+    m[k] = m[k] || {};
+    m[k][s] = (m[k][s] || 0) + 1;
+  };
+  (bunghalLog || []).forEach(e => {
+    (e.records || []).forEach(r => {
+      bump('product', r.product); bump('cause', r.cause); bump('size', r.size);
+      bump('position', r.position); bump('origin', r.originProc); bump('action', r.action);
+    });
+    (e.productionRecords || []).forEach(r => {
+      bump('product', r.product); bump('size', r.size); bump('position', r.position);
+    });
+    bump('owner', e.owner);
+  });
+  return m;
+}
+
+const codeCount = (used, it) =>
+  (used[it.code] || 0) + (it.aliases || []).reduce((s, a) => s + (used[a] || 0), 0);
+
+// 많이 쓰인 코드가 위로 — 순서를 손으로 관리할 필요가 없다
+function sortCodesByUsage(codes, usage) {
+  const out = {};
+  Object.keys(codes).forEach(k => {
+    const used = usage[k] || {};
+    out[k] = codes[k].slice().sort((a, b) => codeCount(used, b) - codeCount(used, a));
+  });
+  return out;
+}
+
 function CodeMasterPage({ data, onSave }) {
   const toast = useToast();
   const dialog = useConfirm();
   const catalog = data.productCatalog || DEFAULT_PRODUCT_CATALOG;
   const bunghalLog = data.bunghalLog || [];
 
+  const usage = useMemo(() => tallyCodeUsage(bunghalLog), [bunghalLog]);
   const [group, setGroup] = useState(CODE_GROUPS[0].key);
-  const [draft, setDraft] = useState(() => toCodeMaster(catalog));
+  const [draft, setDraft] = useState(() =>
+    sortCodesByUsage(toCodeMaster(catalog), tallyCodeUsage(data.bunghalLog || [])));
   const [dirty, setDirty] = useState(false);
+  const [mergeFrom, setMergeFrom] = useState(null);  // 합치는 중인 행
+  const [mergeTo, setMergeTo] = useState('');
+  const [aliasAt, setAliasAt] = useState(null);      // 표기를 직접 적는 중인 행
+  const [aliasText, setAliasText] = useState('');
   const dirtyRef = useRef(false);
 
   useEffect(() => registerDirtyCheck(() => dirtyRef.current), []);
+  useEffect(() => { setMergeFrom(null); setAliasAt(null); }, [group]);
 
   const touch = (next) => { dirtyRef.current = true; setDirty(true); setDraft(next); };
-
-  // 저장된 작업일지 기준 실제 사용 횟수 — 어떤 코드가 살아있고 죽었는지 보인다
-  const usage = useMemo(() => {
-    const m = {};
-    const bump = (k, v) => {
-      const s = String(v || '').trim();
-      if (!s) return;
-      m[k] = m[k] || {};
-      m[k][s] = (m[k][s] || 0) + 1;
-    };
-    bunghalLog.forEach(e => {
-      (e.records || []).forEach(r => {
-        bump('product', r.product); bump('cause', r.cause); bump('size', r.size);
-        bump('position', r.position); bump('origin', r.originProc); bump('action', r.action);
-      });
-      (e.productionRecords || []).forEach(r => {
-        bump('product', r.product); bump('size', r.size); bump('position', r.position);
-      });
-      bump('owner', e.owner);
-    });
-    return m;
-  }, [bunghalLog]);
 
   const gdef  = CODE_GROUPS.find(g => g.key === group) || CODE_GROUPS[0];
   const items = draft[group] || [];
   const used  = usage[group] || {};
-  const countOf = (it) =>
-    (used[it.code] || 0) + (it.aliases || []).reduce((s, a) => s + (used[a] || 0), 0);
+  const countOf = (it) => codeCount(used, it);
 
   const setItems = (fn) => touch({ ...draft, [group]: fn(items) });
   const updateItem = (i, patch) => setItems(rs => rs.map((r, j) => j === i ? { ...r, ...patch } : r));
-  const addItem = () => setItems(rs => [...rs, { code: '', aliases: [], active: true }]);
-  const move = (i, d) => setItems(rs => {
-    const j = i + d;
-    if (j < 0 || j >= rs.length) return rs;
-    const out = rs.slice();
-    const t = out[i]; out[i] = out[j]; out[j] = t;
-    return out;
-  });
+  const addItem = () => { setItems(rs => [{ code: '', aliases: [], active: true }, ...rs]); setAliasAt(null); };
+
   const removeItem = async (i) => {
     const it = items[i];
     const n = countOf(it);
     if (n > 0 && !await dialog(
       `"${it.code}" 는 저장된 기록에 ${n}건 쓰였습니다.\n` +
-      `삭제해도 과거 기록은 그대로 남지만 목록·자동완성에서는 사라집니다.\n\n` +
-      `더 안 쓰는 코드라면 삭제보다 "사용" 체크를 끄는 편이 안전합니다.\n삭제할까요?`)) return;
+      `삭제해도 과거 기록은 남지만 목록·자동완성에서는 사라집니다.\n\n` +
+      `다른 코드와 같은 것이라면 삭제 대신 "합치기"를,\n` +
+      `더 안 쓰는 코드라면 "사용" 체크를 끄는 편이 안전합니다.\n\n삭제할까요?`)) return;
     setItems(rs => rs.filter((_, j) => j !== i));
   };
 
-  // 저장된 기록에 실제로 쓰였는데 코드에 없는 값을 가져온다.
-  // 공백만 다른 표기는 새 코드가 아니라 기존 코드의 "다른 표기"로 붙인다.
+  const addAlias = (i, raw) => {
+    const v = String(raw || '').trim();
+    if (!v) return;
+    if (items.some(x => x.code === v)) {
+      toast(`"${v}" 는 이미 코드로 있습니다 — 합치기를 쓰세요`, 'warn');
+      return;
+    }
+    setItems(rs => rs.map((r, j) => j === i
+      ? { ...r, aliases: [...new Set([...(r.aliases || []), v])] } : r));
+  };
+  const removeAlias = (i, a) =>
+    setItems(rs => rs.map((r, j) => j === i
+      ? { ...r, aliases: (r.aliases || []).filter(x => x !== a) } : r));
+
+  // 두 코드가 같은 것일 때 하나로 합친다 — 사용자는 "같다"만 판단하면 된다
+  const doMerge = () => {
+    if (mergeFrom === null || !mergeTo) return;
+    const from = items[mergeFrom];
+    if (!from || from.code === mergeTo) { setMergeFrom(null); return; }
+    setItems(rs => rs
+      .map(r => r.code === mergeTo
+        ? { ...r, aliases: [...new Set([...(r.aliases || []), from.code, ...(from.aliases || [])])] }
+        : r)
+      .filter((_, j) => j !== mergeFrom));
+    toast(`"${from.code}" 를 "${mergeTo}" 로 합쳤습니다`, 'success');
+    setMergeFrom(null);
+    setMergeTo('');
+  };
+
+  // 저장된 기록에서 코드를 가져온다.
+  // 띄어쓰기만 다른 표기는 새 코드가 아니라 기존 코드의 표기로 붙이고,
+  // 대표 코드는 띄어쓰기가 있는 쪽으로 맞춘다.
   const fillFromRecords = () => {
     const squash = (s) => s.replace(/\s+/g, '');
     const next = items.map(x => ({ ...x, aliases: [...(x.aliases || [])] }));
+    let added = 0, merged = 0;
+
+    const absorb = (hit, v) => {
+      if (v.includes(' ') && !hit.code.includes(' ')) {   // 띄어쓰기 있는 쪽을 대표로
+        hit.aliases.push(hit.code);
+        hit.code = v;
+      } else if (v !== hit.code) {
+        hit.aliases.push(v);
+      }
+      hit.aliases = [...new Set(hit.aliases.filter(a => a !== hit.code))];
+    };
+
+    // 1) 이미 들어와 있는 코드 중 띄어쓰기만 다른 것끼리 먼저 정리
+    for (let i = next.length - 1; i >= 0; i--) {
+      const dup = next.findIndex((x, j) => j < i && squash(x.code) === squash(next[i].code));
+      if (dup < 0) continue;
+      absorb(next[dup], next[i].code);
+      next[dup].aliases = [...new Set([...next[dup].aliases, ...next[i].aliases])];
+      next.splice(i, 1);
+      merged++;
+    }
+
+    // 2) 기록에 있는 값을 띄어쓰기 기준으로 묶어서 가져온다.
+    //    "패턴접힘"(7)과 "패턴 접힘"(1)을 따로 세면 뒤쪽이 기준 미달로 빠져
+    //    띄어쓰기 없는 쪽이 대표 코드가 돼버린다. 묶어서 세고 대표만 고른다.
     const known = new Set(next.map(x => x.code));
     const owned = new Set(next.reduce((a, x) => a.concat(x.aliases), []));
-    let added = 0, merged = 0;
-    Object.keys(used)
-      .filter(v => !known.has(v) && !owned.has(v) && used[v] >= CATALOG_AUTO_MIN_COUNT)
-      .filter(v => group !== 'product' || looksLikeProductCode(v))
-      .sort((a, b) => used[b] - used[a])
-      .forEach(v => {
-        const hit = next.find(x => squash(x.code) === squash(v));
-        if (hit) { hit.aliases.push(v); merged++; return; }
-        next.push({ code: v, aliases: [], active: true });
+    const buckets = {};
+    Object.keys(used).forEach(v => {
+      const k = squash(v);
+      (buckets[k] = buckets[k] || []).push(v);
+    });
+    Object.values(buckets)
+      .map(vs => ({
+        vs,
+        total: vs.reduce((s, v) => s + used[v], 0),
+        // 대표는 띄어쓰기가 있는 표기, 같으면 많이 쓰인 쪽
+        rep: vs.slice().sort((a, b) =>
+          ((b.includes(' ') ? 1 : 0) - (a.includes(' ') ? 1 : 0)) || (used[b] - used[a]))[0],
+      }))
+      .filter(b => b.total >= CATALOG_AUTO_MIN_COUNT)
+      .filter(b => group !== 'product' || looksLikeProductCode(b.rep))
+      .sort((a, b) => b.total - a.total)
+      .forEach(b => {
+        const hit = next.find(x => squash(x.code) === squash(b.rep));
+        if (hit) { b.vs.forEach(v => absorb(hit, v)); merged++; return; }
+        if (known.has(b.rep) || owned.has(b.rep)) return;
+        const others = [...new Set(b.vs.filter(v => v !== b.rep && !owned.has(v)))];
+        next.push({ code: b.rep, aliases: others, active: true });
         added++;
+        if (others.length) merged++;
       });
+
     if (!added && !merged) { toast('가져올 코드가 없습니다', 'info'); return; }
-    touch({ ...draft, [group]: next });
-    toast(`코드 ${added}건 추가 · 표기 ${merged}건 병합 — 확인 후 저장하세요`, 'info');
+    const sorted = next.slice().sort((a, b) => countOf(b) - countOf(a));
+    touch({ ...draft, [group]: sorted });
+    toast(`코드 ${added}건 추가 · 표기 ${merged}건 정리 — 뜻이 같은 코드는 "합치기"로 묶어주세요`, 'info', { duration: 5000 });
   };
 
   const revert = () => {
-    setDraft(toCodeMaster(catalog));
+    setDraft(sortCodesByUsage(toCodeMaster(catalog), usage));
     dirtyRef.current = false;
     setDirty(false);
+    setMergeFrom(null);
   };
 
   const save = () => {
@@ -8489,19 +8580,21 @@ function CodeMasterPage({ data, onSave }) {
     for (const g of CODE_GROUPS) {
       const list = (draft[g.key] || []).map(x => ({
         code: String(x.code || '').trim(),
-        aliases: [...new Set((x.aliases || []).map(a => String(a).trim()).filter(Boolean))],
+        aliases: [...new Set((x.aliases || []).map(a => String(a).trim()).filter(Boolean))]
+          .filter(a => a !== String(x.code || '').trim()),
         active: x.active !== false,
       })).filter(x => x.code);
       const seen = new Set();
       for (const x of list) {
-        if (seen.has(x.code)) { toast(`${g.label}: "${x.code}" 코드가 중복됩니다`, 'warn'); return; }
+        if (seen.has(x.code)) { toast(`${g.label}: "${x.code}" 코드가 중복됩니다 — 합치기로 묶어주세요`, 'warn'); return; }
         seen.add(x.code);
       }
       if (!list.some(x => x.active)) { toast(`${g.label}: 사용 중인 코드가 하나도 없습니다`, 'warn'); return; }
       cleaned[g.key] = list;
     }
-    onSave(applyCodeMaster(catalog, cleaned));
-    setDraft(cleaned);
+    const sorted = sortCodesByUsage(cleaned, usage);
+    onSave(applyCodeMaster(catalog, sorted));
+    setDraft(sorted);
     dirtyRef.current = false;
     setDirty(false);
     toast('공통코드 저장 완료', 'success');
@@ -8545,12 +8638,10 @@ function CodeMasterPage({ data, onSave }) {
       <Card>
         <CardHeader
           title={`${gdef.label} 코드`}
-          sub={gdef.alias
-            ? '사진 인식·자동완성이 함께 쓰는 목록입니다. 다른 표기는 이 코드로 통일됩니다.'
-            : '사진 인식·자동완성이 함께 쓰는 목록입니다.'}
+          sub="많이 쓰인 순으로 보여줍니다. 같은 것을 다르게 적고 있다면 합쳐주세요."
           right={
             <button onClick={fillFromRecords}
-              title={`저장된 작업일지에 ${CATALOG_AUTO_MIN_COUNT}회 이상 쓰였는데 코드에 없는 값을 가져옵니다`}
+              title={`작업일지에 ${CATALOG_AUTO_MIN_COUNT}회 이상 쓰였는데 코드에 없는 값을 가져옵니다`}
               className={`${btn} border border-slate-200 text-slate-600 hover:bg-slate-50`}>
               <Icon name="upload" size={13} />저장된 기록에서 가져오기
             </button>
@@ -8560,11 +8651,9 @@ function CodeMasterPage({ data, onSave }) {
             <table className="w-full text-xs">
               <thead>
                 <tr className="bg-slate-50 text-slate-500">
-                  <th className="px-2 py-2 text-center font-semibold w-[70px]">순서</th>
-                  <th className="px-2 py-2 text-center font-semibold w-[180px]">코드</th>
-                  <th className="px-2 py-2 text-center font-semibold">
-                    다른 표기 {gdef.alias ? '' : '(이 그룹은 미사용)'}
-                  </th>
+                  <th className="px-3 py-2 text-left font-semibold w-[200px]">코드</th>
+                  <th className="px-3 py-2 text-left font-semibold">같은 뜻으로 묶인 표기</th>
+                  <th className="px-2 py-2 text-center font-semibold w-[130px]">합치기</th>
                   <th className="px-2 py-2 text-center font-semibold w-[60px]">사용</th>
                   <th className="px-2 py-2 text-center font-semibold w-[80px]">기록 건수</th>
                   <th className="px-2 py-2 w-[40px]"></th>
@@ -8579,34 +8668,67 @@ function CodeMasterPage({ data, onSave }) {
                   const off = it.active === false;
                   return (
                     <tr key={i} className={`border-t border-slate-100 ${off ? 'bg-slate-50/70 text-slate-400' : 'hover:bg-slate-50/40'}`}>
-                      <td className="px-2 py-1 text-center whitespace-nowrap">
-                        <button onClick={() => move(i, -1)} disabled={i === 0}
-                          className={`px-1 ${i === 0 ? 'text-slate-200' : 'text-slate-400 hover:text-slate-700'}`}>▲</button>
-                        <button onClick={() => move(i, 1)} disabled={i === items.length - 1}
-                          className={`px-1 ${i === items.length - 1 ? 'text-slate-200' : 'text-slate-400 hover:text-slate-700'}`}>▼</button>
-                      </td>
-                      <td className="px-1 py-1">
+                      <td className="px-2 py-1.5">
                         <input type="text" value={it.code}
                           onChange={e => updateItem(i, { code: e.target.value })}
                           placeholder="코드값"
-                          className="w-full px-2 py-1 border border-transparent hover:border-slate-200 rounded text-xs text-center font-semibold focus:outline-none focus:ring-2 focus:ring-slate-300" />
+                          className="w-full px-2 py-1 border border-transparent hover:border-slate-200 rounded text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-slate-300" />
                       </td>
-                      <td className="px-1 py-1">
-                        <input type="text"
-                          value={(it.aliases || []).join(', ')}
-                          onChange={e => updateItem(i, { aliases: e.target.value.split(',').map(s => s.trim()).filter(Boolean) })}
-                          disabled={!gdef.alias}
-                          placeholder={gdef.alias ? '콤마로 구분 — 이 표기로 적혀 있으면 위 코드로 바뀝니다' : ''}
-                          className="w-full px-2 py-1 border border-transparent hover:border-slate-200 rounded text-xs focus:outline-none focus:ring-2 focus:ring-slate-300 disabled:bg-transparent disabled:placeholder-transparent" />
+                      <td className="px-2 py-1.5">
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          {(it.aliases || []).map(a => (
+                            <span key={a} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 text-[11px]">
+                              {a}
+                              <button onClick={() => removeAlias(i, a)}
+                                title="이 표기를 떼어냅니다" className="text-slate-400 hover:text-rose-600 leading-none">×</button>
+                            </span>
+                          ))}
+                          {aliasAt === i ? (
+                            <input type="text" autoFocus value={aliasText}
+                              onChange={e => setAliasText(e.target.value)}
+                              onKeyDown={e => {
+                                if (e.key === 'Enter') { addAlias(i, aliasText); setAliasText(''); }
+                                if (e.key === 'Escape') { setAliasAt(null); setAliasText(''); }
+                              }}
+                              onBlur={() => { addAlias(i, aliasText); setAliasText(''); setAliasAt(null); }}
+                              placeholder="잘못 적히는 표기 · Enter"
+                              className="px-2 py-0.5 border border-slate-300 rounded text-[11px] w-[180px] focus:outline-none focus:ring-2 focus:ring-slate-300" />
+                          ) : (
+                            <button onClick={() => { setAliasAt(i); setAliasText(''); }}
+                              title="사진 인식이 이 코드를 다르게 읽을 때, 그 표기를 여기에 적어두면 자동으로 바뀝니다"
+                              className="text-[11px] text-slate-400 hover:text-slate-700">+ 표기</button>
+                          )}
+                        </div>
                       </td>
-                      <td className="px-2 py-1 text-center">
+                      <td className="px-2 py-1.5 text-center">
+                        {mergeFrom === i ? (
+                          <div className="flex items-center gap-1 justify-center">
+                            <select value={mergeTo} onChange={e => setMergeTo(e.target.value)}
+                              className="px-1.5 py-1 border border-slate-300 rounded text-[11px] max-w-[110px] focus:outline-none">
+                              <option value="">어디에?</option>
+                              {items.filter((_, j) => j !== i).map(x => (
+                                <option key={x.code} value={x.code}>{x.code}</option>
+                              ))}
+                            </select>
+                            <button onClick={doMerge} disabled={!mergeTo}
+                              className={`text-[11px] px-1.5 py-1 rounded font-semibold ${mergeTo ? 'bg-slate-700 text-white hover:bg-slate-800' : 'bg-slate-100 text-slate-300'}`}>확인</button>
+                            <button onClick={() => { setMergeFrom(null); setMergeTo(''); }}
+                              className="text-[11px] px-1 text-slate-400 hover:text-slate-700">취소</button>
+                          </div>
+                        ) : (
+                          <button onClick={() => { setMergeFrom(i); setMergeTo(''); }}
+                            title={`"${it.code}" 가 다른 코드와 같은 것이면 하나로 묶습니다`}
+                            className="text-[11px] px-2 py-1 rounded border border-slate-200 text-slate-500 hover:bg-slate-100">합치기</button>
+                        )}
+                      </td>
+                      <td className="px-2 py-1.5 text-center">
                         <input type="checkbox" checked={it.active !== false}
                           onChange={e => updateItem(i, { active: e.target.checked })}
                           title="끄면 자동완성·사진 인식 목록에서 빠집니다 (과거 기록은 유지)"
                           className="w-3.5 h-3.5 align-middle accent-slate-700" />
                       </td>
-                      <td className={`px-2 py-1 text-center num ${n === 0 ? 'text-slate-300' : ''}`}>{n}</td>
-                      <td className="px-2 py-1 text-center">
+                      <td className={`px-2 py-1.5 text-center num ${n === 0 ? 'text-slate-300' : ''}`}>{n}</td>
+                      <td className="px-2 py-1.5 text-center">
                         <button onClick={() => removeItem(i)}
                           className="text-slate-400 hover:text-rose-600 text-base leading-none">×</button>
                       </td>
@@ -8617,12 +8739,13 @@ function CodeMasterPage({ data, onSave }) {
             </table>
           </div>
 
-          <div className="flex items-center justify-between mt-2.5">
+          <div className="flex items-start justify-between gap-4 mt-2.5">
             <button onClick={addItem}
-              className="text-[11px] px-2.5 py-1.5 rounded text-slate-600 hover:bg-slate-100 font-semibold">+ 코드 추가</button>
+              className="text-[11px] px-2.5 py-1.5 rounded text-slate-600 hover:bg-slate-100 font-semibold whitespace-nowrap">+ 코드 추가</button>
             <div className="text-[10px] text-slate-400 text-right leading-relaxed">
-              사용을 끄면 과거 기록은 그대로 두고 목록에서만 빠집니다 — 단종 품목은 삭제보다 이쪽이 안전합니다.<br />
-              코드에 없는 값도 작업일지에 {CATALOG_AUTO_MIN_COUNT}회 이상 저장되면 사진 인식 사전에 자동으로 포함됩니다.
+              <b className="text-slate-500">합치기</b> — 같은 것을 다르게 부르고 있을 때 (예: 구멍 → 원단구멍). 과거 기록의 집계도 함께 합쳐집니다.<br />
+              <b className="text-slate-500">+ 표기</b> — 코드로는 안 쓰지만 사진에서 그렇게 읽히는 글자를 적어둡니다 (예: 고명 → 원단구멍).<br />
+              <b className="text-slate-500">사용 끄기</b> — 단종 품목처럼 더 안 쓰는 코드. 과거 기록은 그대로 두고 목록에서만 뺍니다.
             </div>
           </div>
         </div>
