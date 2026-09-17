@@ -4588,6 +4588,7 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onOpenCode
   const inputDirtyRef = useRef(false);   // 사용자가 입력 표를 직접 손댔는지 — 동기화가 덮어쓰지 못하게 함
   const lastLoadedKeyRef = useRef(null); // 마지막으로 불러온 '일자|작업자' 키
   const draftNotifiedRef = useRef(false); // 임시저장 복원 안내를 한 번만 띄우기 위함
+  const lastDraftRef = useRef(null);      // 마지막으로 기록한 임시저장 내용
 
   // 새로고침·창 닫기 경고에 이 화면의 미저장 여부를 등록
   useEffect(() => registerDirtyCheck(() => inputDirtyRef.current), []);
@@ -4595,12 +4596,19 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onOpenCode
   // 입력 중인 내용을 계속 임시저장 — 탭을 옮기거나 새로고침해도 복원된다
   useEffect(() => {
     if (!inputDirtyRef.current) return;
-    writeBunghalDraft({
+    const payload = {
       date: inputDate,
       owner: (inputOwner || '').trim(),
       records: inputRecords,
       productionRecords,
-    });
+    };
+    const json = JSON.stringify(payload);
+    // 복원 직후처럼 내용이 그대로면 다시 쓰지 않는다.
+    // 다시 쓰면 savedAt 이 갱신돼 3일 만료가 영원히 리셋되고,
+    // 지운 적 없는 옛 입력이 열 때마다 계속 되살아난다.
+    if (lastDraftRef.current === json) return;
+    lastDraftRef.current = json;
+    writeBunghalDraft(payload);
   }, [inputDate, inputOwner, inputRecords, productionRecords]);
 
   const hasPassword = !!data.geminiPassHash;
@@ -4804,22 +4812,47 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onOpenCode
     lastLoadedKeyRef.current = key;
     if (keyChanged) inputDirtyRef.current = false; // 헤더를 직접 바꾼 것이므로 새 entry 기준으로 초기화
     const ex = bunghalLog.find(e => e.date === inputDate && (e.owner || '') === (inputOwner || '').trim());
+    const fromEntry = () => {
+      setInputRecords(ex && ex.records ? ex.records : [makeEmptyBunghalRecord()]);
+      setProductionRecords(ex && ex.productionRecords ? ex.productionRecords : [makeEmptyProductionRecord()]);
+    };
+
     // 임시저장본이 같은 일자·작업자이고 저장본보다 나중이면 그쪽을 복원한다
     const draft = readBunghalDraft();
     const draftFits = draft && draft.date === inputDate && (draft.owner || '') === (inputOwner || '').trim();
-    const draftNewer = draftFits && (!ex || !ex.updatedAt || new Date(draft.savedAt) > new Date(ex.updatedAt));
+    const draftHasContent = draftFits &&
+      ((draft.records || []).some(rowHasContent) || (draft.productionRecords || []).some(rowHasContent));
+    if (draftFits && !draftHasContent) clearBunghalDraft();   // 빈 껍데기는 남겨둘 이유가 없다
+    const draftNewer = draftHasContent && (!ex || !ex.updatedAt || new Date(draft.savedAt) > new Date(ex.updatedAt));
+
     if (draftNewer) {
+      const recs  = draft.records && draft.records.length ? draft.records : [makeEmptyBunghalRecord()];
+      const prods = draft.productionRecords && draft.productionRecords.length ? draft.productionRecords : [makeEmptyProductionRecord()];
       inputDirtyRef.current = true;
-      setInputRecords(draft.records && draft.records.length ? draft.records : [makeEmptyBunghalRecord()]);
-      setProductionRecords(draft.productionRecords && draft.productionRecords.length ? draft.productionRecords : [makeEmptyProductionRecord()]);
+      // 복원한 내용을 그대로 기록해 둬야 임시저장이 스스로 갱신되지 않는다
+      lastDraftRef.current = JSON.stringify({
+        date: inputDate, owner: (inputOwner || '').trim(), records: recs, productionRecords: prods,
+      });
+      setInputRecords(recs);
+      setProductionRecords(prods);
       if (!draftNotifiedRef.current) {
         draftNotifiedRef.current = true;
-        toast('저장하지 않은 입력을 복원했습니다', 'info');
+        toast(`${draft.date} · ${draft.owner || '—'} 의 저장하지 않은 입력을 복원했습니다`, 'info', {
+          duration: 9000,
+          action: {
+            label: '지우기',
+            onClick: () => {
+              clearBunghalDraft();
+              lastDraftRef.current = null;
+              inputDirtyRef.current = false;
+              fromEntry();
+            },
+          },
+        });
       }
       return;
     }
-    setInputRecords(ex && ex.records ? ex.records : [makeEmptyBunghalRecord()]);
-    setProductionRecords(ex && ex.productionRecords ? ex.productionRecords : [makeEmptyProductionRecord()]);
+    fromEntry();
   }, [inputDate, inputOwner, bunghalLog, originalRecords]); // editingEntryId는 의도적으로 deps 제외
 
   const handleSaveOwner = (name) => {
@@ -4928,6 +4961,7 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onOpenCode
       : [...bunghalLog, entry];
     setEditingEntryId(null);
     inputDirtyRef.current = false;
+    lastDraftRef.current = null;
     clearBunghalDraft();
     onSaveLog(next);
 
@@ -4999,6 +5033,7 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onOpenCode
     setEditingEntryId(null);
     onSaveLog(next);
     inputDirtyRef.current = false;
+    lastDraftRef.current = null;
     clearBunghalDraft();
     setInputRecords([makeEmptyBunghalRecord()]);
     setProductionRecords([makeEmptyProductionRecord()]);
@@ -5023,6 +5058,7 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onOpenCode
     setInputOwner(entry.owner || '');
     // records를 직접 로드 (useEffect가 editingEntryId 때문에 skip하므로)
     inputDirtyRef.current = false;
+    lastDraftRef.current = null;
     clearBunghalDraft();
     lastLoadedKeyRef.current = `${entry.date}|${(entry.owner || '').trim()}`;
     setInputRecords(entry.records?.length ? entry.records : [makeEmptyBunghalRecord()]);
