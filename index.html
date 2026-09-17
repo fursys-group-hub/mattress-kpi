@@ -4824,6 +4824,23 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveGemi
     localStorage.setItem('kpi_owner_bunghal', name);
   };
 
+  // 저장된 기록으로 보강한 사전 — 자동완성과 사진 인식에 함께 쓴다
+  const liveCatalog = useMemo(() => effectiveCatalog(catalog, bunghalLog), [catalog, bunghalLog]);
+
+  // 내용이 완전히 같은 행 — 사진 인식의 이중등록을 잡아낸다
+  const duplicateRows = useMemo(() => {
+    const FIELDS = ['product', 'size', 'position', 'qty', 'cause', 'originProc', 'action'];
+    const first = new Map();
+    const dup = new Set();
+    inputRecords.forEach((r, i) => {
+      const parts = FIELDS.map(f => String(r[f] ?? '').trim());
+      if (!parts.some(Boolean)) return;
+      const k = parts.join('|');
+      if (first.has(k)) dup.add(i); else first.set(k, i);
+    });
+    return dup;
+  }, [inputRecords]);
+
   const markInputDirty = () => { inputDirtyRef.current = true; };
 
   const addRecord = () => { markInputDirty(); setInputRecords(rs => [...rs, makeEmptyBunghalRecord()]); };
