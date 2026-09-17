@@ -637,7 +637,74 @@ function getAchievement(kpiKey, value, targets) {
 /* ============================================================
    3) 저장소 — localStorage 캐시 + Firebase 동기화
    ============================================================ */
-const STORE_KEYS = ['production', 'quality', 'targets', 'qualityTargets', 'erpReports', 'priceMaster', 'erpTrash', 'productionTrash', 'weeklyJournal', 'productCatalog', 'bunghalLog', 'bunghalCorrections', 'geminiApiKey', 'geminiPassHash'];
+const STORE_KEYS = ['production', 'quality', 'targets', 'qualityTargets', 'erpReports', 'priceMaster', 'erpTrash', 'productionTrash', 'weeklyJournal', 'productCatalog', 'bunghalLog', 'geminiApiKey', 'geminiPassHash'];
+
+// 공통코드 그룹 — 관리 화면과 저장 구조가 모두 이 정의를 따른다.
+// list = 다른 화면들이 쓰는 평면 배열 이름, alias = 표기 통일 규칙이 저장되는 곳
+const CODE_GROUPS = [
+  { key: 'product',  label: '품목',     list: 'products',  alias: 'aliases' },
+  { key: 'cause',    label: '원인',     list: 'causes',    alias: 'causeAliases' },
+  { key: 'size',     label: '사이즈',   list: 'sizes' },
+  { key: 'position', label: '상/하',    list: 'positions' },
+  { key: 'origin',   label: '원인공정', list: 'origins' },
+  { key: 'action',   label: '처리내역', list: 'actions' },
+  { key: 'owner',    label: '작업자',   list: 'owners' },
+];
+
+// 품목 칸에 메모가 섞인 값("키즈(수선)")이나 품목이 아닌 값은 코드로 받지 않는다
+function looksLikeProductCode(v) {
+  return !!v && v.length <= 12 && !/[()\[\]\/]/.test(v) && !/^(샘플|기타)$/.test(v);
+}
+
+// 저장된 사전을 공통코드 형태로 읽는다.
+// codes 필드가 있으면 그대로, 없으면 기존 평면 배열·표기규칙에서 만들어낸다 (구버전 호환).
+function toCodeMaster(catalog) {
+  const c = catalog || DEFAULT_PRODUCT_CATALOG;
+  const out = {};
+  CODE_GROUPS.forEach(g => {
+    const stored = c.codes && c.codes[g.key];
+    if (stored && stored.length) {
+      out[g.key] = stored.map(x => ({
+        code: String(x.code || '').trim(),
+        aliases: (x.aliases || []).map(a => String(a).trim()).filter(Boolean),
+        active: x.active !== false,
+      })).filter(x => x.code);
+      return;
+    }
+    const byTarget = {};
+    Object.entries((g.alias && c[g.alias]) || {}).forEach(([from, to]) => {
+      (byTarget[to] = byTarget[to] || []).push(from);
+    });
+    out[g.key] = (c[g.list] || []).map(code => ({
+      code, aliases: byTarget[code] || [], active: true,
+    }));
+  });
+  return out;
+}
+
+// 공통코드를 저장 형태로 되돌린다. 다른 화면이 쓰는 평면 배열·표기규칙도 함께 갱신해
+// 기존 코드가 그대로 동작하게 한다. 사용 안 함으로 끈 코드는 평면 배열에서 빠진다.
+function applyCodeMaster(catalog, codes) {
+  const next = { ...(catalog || DEFAULT_PRODUCT_CATALOG), codes };
+  CODE_GROUPS.forEach(g => {
+    const items = codes[g.key] || [];
+    next[g.list] = items.filter(x => x.active !== false).map(x => x.code);
+    if (g.alias) {
+      const m = {};
+      items.forEach(x => (x.aliases || []).forEach(a => {
+        if (a && a !== x.code) m[a] = x.code;
+      }));
+      next[g.alias] = m;
+    }
+  });
+  return next;
+}
+
+// 사용 안 함으로 꺼둔 코드 — 자동 편입이 되살리면 안 된다
+function disabledCodes(catalog, groupKey) {
+  const stored = catalog && catalog.codes && catalog.codes[groupKey];
+  return new Set((stored || []).filter(x => x.active === false).map(x => x.code));
+}
 
 // 저장된 기록에서 이 횟수 이상 쓰인 값은 인식 사전에 자동 편입된다.
 // 사람이 검수해 저장한 값이므로 신뢰할 수 있는 기준.
@@ -888,7 +955,6 @@ function App() {
     weeklyJournal:   LS.get('weeklyJournal', {}),
     productCatalog:  LS.get('productCatalog', DEFAULT_PRODUCT_CATALOG),
     bunghalLog:      LS.get('bunghalLog', []),
-    bunghalCorrections: LS.get('bunghalCorrections', []),
     geminiApiKey:    LS.get('geminiApiKey', '') || localStorage.getItem('kpi_gemini_key') || '',
     geminiPassHash:  LS.get('geminiPassHash', '') || localStorage.getItem('kpi_gemini_pass_hash') || '',
   });
@@ -935,7 +1001,6 @@ function App() {
         weeklyJournal:   fb.weeklyJournal   ?? prev.weeklyJournal,
         productCatalog:  fb.productCatalog  ?? prev.productCatalog,
         bunghalLog:      fb.bunghalLog      ?? prev.bunghalLog,
-        bunghalCorrections: fb.bunghalCorrections ?? prev.bunghalCorrections,
         geminiApiKey:    fb.geminiApiKey    ?? prev.geminiApiKey,
         geminiPassHash:  fb.geminiPassHash  ?? prev.geminiPassHash,
       }));
@@ -964,7 +1029,6 @@ function App() {
   const saveWeeklyJournal   = (j)       => { setData(prev => ({...prev, weeklyJournal:   j})); LS.set('weeklyJournal',   j); };
   const saveProductCatalog  = (c)       => { setData(prev => ({...prev, productCatalog:  c})); LS.set('productCatalog',  c); };
   const saveBunghalLog      = (l)       => { setData(prev => ({...prev, bunghalLog:      l})); LS.set('bunghalLog',      l); };
-  const saveBunghalCorrections = (c)    => { setData(prev => ({...prev, bunghalCorrections: c})); LS.set('bunghalCorrections', c); };
   const saveGeminiApiKey       = (k)    => { setData(prev => ({...prev, geminiApiKey:    k})); LS.set('geminiApiKey',    k || ''); };
   const saveGeminiPassHash     = (h)    => { setData(prev => ({...prev, geminiPassHash:  h})); LS.set('geminiPassHash',  h || ''); };
 
@@ -1010,11 +1074,12 @@ function App() {
           <TopBar route={route} navigate={navigate} lastSync={lastSync} syncing={syncing} pending={pendingCount} />
           <main className="flex-1 px-6 lg:px-10 py-6 max-w-[1600px] w-full mx-auto">
             {route === '/dashboard'           && <DashboardPage     data={data} />}
-            {route === '/production'          && <ProductionPage    data={data} onSave={saveProduction} onSaveTrash={saveProductionTrash} onSaveJournal={saveWeeklyJournal} onSaveCatalog={saveProductCatalog} onSaveBunghalLog={saveBunghalLog} onSaveBunghalCorrections={saveBunghalCorrections} onSaveGeminiKey={saveGeminiApiKey} onSaveGeminiPassHash={saveGeminiPassHash} />}
+            {route === '/production'          && <ProductionPage    data={data} onSave={saveProduction} onSaveTrash={saveProductionTrash} onSaveJournal={saveWeeklyJournal} onSaveCatalog={saveProductCatalog} onSaveBunghalLog={saveBunghalLog} onSaveGeminiKey={saveGeminiApiKey} onSaveGeminiPassHash={saveGeminiPassHash} />}
             {route === '/quality'             && <QualityPage       data={data}
                                                                     onSave={saveQuality}
                                                                     onSaveErp={saveErpReports}
                                                                     onSaveErpTrash={saveErpTrash} />}
+            {route === '/codes'               && <CodeMasterPage     data={data} onSave={saveProductCatalog} />}
             {route === '/production/settings' && <ProductionSettings data={data} onSave={saveTargets} />}
             {route === '/quality/settings'    && <QualitySettings    data={data} onSave={saveQualityTargets} />}
             {/* 구 라우트 호환 */}
@@ -1036,6 +1101,7 @@ const PAGE_META = {
   '/production/settings': { title: '생산팀 목표 설정',  sub: '5개 KPI의 목표·주의·경고 임계값',    tag: 'PRODUCTION · SETTINGS', accent: 'sky' },
   '/quality':             { title: '품질보증팀 입력',   sub: '퀼팅 공정 부적합 현황 일별 집계',     tag: 'QUALITY',    accent: 'rose' },
   '/quality/settings':    { title: '품질보증팀 목표 설정', sub: '월 누적 부적합·손실 상한 기준',     tag: 'QUALITY · SETTINGS',    accent: 'rose' },
+  '/codes':               { title: '공통코드 관리',     sub: '품목·사이즈·상하·원인·원인공정·처리내역·작업자', tag: 'MASTER DATA', accent: 'slate' },
 };
 
 function TopBar({ route, navigate, lastSync, syncing, pending = 0 }) {
@@ -1051,7 +1117,8 @@ function TopBar({ route, navigate, lastSync, syncing, pending = 0 }) {
     : '연결 중…';
 
   // 페이지별 우측 네비 정의
-  const inProd     = route === '/production' || route === '/production/settings';
+  const inCodes    = route === '/codes';
+  const inProd     = route === '/production' || route === '/production/settings' || inCodes;
   const inQual     = route === '/quality'    || route === '/quality/settings';
   const inSettings = route.endsWith('/settings');
 
@@ -1078,6 +1145,10 @@ function TopBar({ route, navigate, lastSync, syncing, pending = 0 }) {
           {inProd && (
             <Fragment>
               <NavBtn onClick={() => navigate('/quality')} accent="rose" icon={<Icon name="shield" size={16} />} label="품질보증팀" />
+              <NavBtn onClick={() => navigate(inCodes ? '/production' : '/codes')}
+                accent={inCodes ? 'slate-active' : 'slate'}
+                icon={<Icon name={inCodes ? 'pencil' : 'notebook'} size={16} />}
+                label={inCodes ? '입력 화면' : '공통코드'} />
               <NavBtn
                 onClick={() => navigate(inSettings ? '/production' : '/production/settings')}
                 accent={inSettings ? 'slate-active' : 'sky'}
@@ -3160,7 +3231,7 @@ function RecentQualityTable({ entries }) {
 /* ============================================================
    22) PRODUCTION PAGE — 일별 입력
    ============================================================ */
-function ProductionPage({ data, onSave, onSaveTrash, onSaveJournal, onSaveCatalog, onSaveBunghalLog, onSaveBunghalCorrections, onSaveGeminiKey, onSaveGeminiPassHash }) {
+function ProductionPage({ data, onSave, onSaveTrash, onSaveJournal, onSaveCatalog, onSaveBunghalLog, onSaveGeminiKey, onSaveGeminiPassHash }) {
   const toast = useToast();
   const [tab, setTab] = useState('input');
   const today = todayYMD();
@@ -3308,7 +3379,7 @@ function ProductionPage({ data, onSave, onSaveTrash, onSaveJournal, onSaveCatalo
       {tab === 'summary' && <ProductionSummaryTab data={data} />}
       {/* 기록·분석은 같은 컴포넌트를 mode만 바꿔 재사용 — 같은 JSX 위치를 유지해야 탭을 오가도 입력 중인 표가 살아남는다 */}
       {(tab === 'bunghalRecord' || tab === 'bunghal') &&
-        <BunghalAnalysisTab mode={tab === 'bunghalRecord' ? 'record' : 'analysis'} data={data} onSave={onSave} onSaveLog={onSaveBunghalLog} onSaveCatalog={onSaveCatalog} onSaveCorrections={onSaveBunghalCorrections} onSaveGeminiKey={onSaveGeminiKey} onSaveGeminiPassHash={onSaveGeminiPassHash} />}
+        <BunghalAnalysisTab mode={tab === 'bunghalRecord' ? 'record' : 'analysis'} data={data} onSave={onSave} onSaveLog={onSaveBunghalLog} onSaveCatalog={onSaveCatalog} onSaveGeminiKey={onSaveGeminiKey} onSaveGeminiPassHash={onSaveGeminiPassHash} />}
       {tab === 'history' && <ProductionHistoryTab data={data} onSave={onSave} onSaveTrash={onSaveTrash} />}
     </div>
   );
@@ -4160,38 +4231,14 @@ function effectiveCatalog(catalog, bunghalLog, minCount = CATALOG_AUTO_MIN_COUNT
   });
   const frequent = (m) => Object.keys(m).filter(k => m[k] >= minCount);
   const union = (a, b) => [...new Set([...(a || []), ...b])];
-  // 품목 칸에 메모가 섞인 값("키즈(수선)")이나 품목이 아닌 값은 자동 편입에서 제외
-  const looksLikeProduct = (v) => v.length <= 12 && !/[()\[\]\/]/.test(v) && !/^(샘플|기타)$/.test(v);
+  // 공통코드에서 "사용 안 함"으로 꺼둔 값은 자동 편입이 되살리지 않는다
+  const offP = disabledCodes(base, 'product');
+  const offC = disabledCodes(base, 'cause');
   return {
     ...base,
-    products: union(base.products, frequent(prodTally).filter(looksLikeProduct)),
-    causes:   union(base.causes,   frequent(causeTally)),
+    products: union(base.products, frequent(prodTally).filter(v => looksLikeProductCode(v) && !offP.has(v))),
+    causes:   union(base.causes,   frequent(causeTally).filter(v => !offC.has(v))),
   };
-}
-
-// 프롬프트에 넣을 교정만 추린다.
-// - 이미 사전에 있는 정상값을 "틀렸다"고 표시한 항목은 글자 오인식이 아니라 판단 변경이므로 제외.
-//   (행 밀림으로 생긴 "수선"→"폐기" 같은 가짜 교정이 여기서 걸러진다)
-// - 자유 텍스트인 품목·원인만 학습 대상. 사이즈·위치·공정·처리는 실제 데이터가 100% 사전 값이라 배울 것이 없다.
-function usefulCorrections(corrections, cat) {
-  const vocab = {
-    product: new Set((cat && cat.products) || []),
-    cause:   new Set((cat && cat.causes) || []),
-  };
-  const seen = new Set();
-  const out = [];
-  (corrections || []).forEach(c => {
-    if (!vocab[c.field]) return;
-    const w = String(c.wrong || '').trim();
-    const r = String(c.correct || '').trim();
-    if (!w || !r || w === r) return;
-    if (vocab[c.field].has(w)) return;
-    const k = `${c.field}:${w}→${r}`;
-    if (seen.has(k)) return;
-    seen.add(k);
-    out.push(c);
-  });
-  return out.slice(-30);
 }
 
 // 이미지 압축 — 최대 1500px, JPEG 85% (OCR 품질 유지하면서 전송 크기 축소)
@@ -4213,12 +4260,9 @@ function compressImageDataUrl(dataUrl, maxPx = 1500, quality = 0.85) {
 }
 
 // Gemini Vision에 보낼 프롬프트 (사전 + 규칙 + 자가학습 컨텍스트)
-function buildBunghalPrompt(catalog, corrections) {
+function buildBunghalPrompt(catalog) {
   const aliasStr = Object.entries(catalog.aliases || {})
     .map(([k, v]) => `  - "${k}" → "${v}"`).join('\n') || '  (없음)';
-  const corrStr = (corrections || []).length
-    ? corrections.map(c => `  - "${c.wrong}" → "${c.correct}"`).join('\n')
-    : '  (없음)';
   return `당신은 매트리스 공장의 손글씨 작업일지를 읽어서 *두 개의 표*를 JSON 객체로 변환합니다.
 
 [표 구조 — 작업일지에는 표가 두 개 있습니다]
@@ -4288,11 +4332,6 @@ ${aliasStr}
 - 원인 텍스트에 "수선" 또는 "수선건" 표현이 *포함*되어 있으면 originProc = "수선"
 - 예: "원단구멍 (수선건)" → cause: "원단구멍", originProc: "수선"
 - cause 필드에서는 괄호 부분·"수선"/"수선건" 표현을 제거하여 *순수 원인*만 남김
-
-[이전 오인식 — 글자 모양이 비슷해 헷갈렸던 사례]
-아래는 *글자를 잘못 읽었던* 사례입니다. 비슷한 글자꼴이 보일 때만 참고하십시오.
-사진에 명확히 다른 글자가 적혀 있으면 아래 목록보다 *사진을 우선*합니다.
-${corrStr}
 
 [작업일지 메타정보]
 사진 상단에 "작업일자"와 "작업자"가 적혀있습니다.
@@ -4497,7 +4536,7 @@ function BunghalDonutChart({ items, palette }) {
   );
 }
 
-function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorrections, onSaveGeminiKey, onSaveGeminiPassHash, mode = 'analysis' }) {
+function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveGeminiKey, onSaveGeminiPassHash, mode = 'analysis' }) {
   const isRecord = mode === 'record';
   const isAnalysis = mode === 'analysis';
   const toast = useToast();
@@ -4522,8 +4561,6 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
 
   // 작업일지 입력 영역 상태
   const [inputOpen, setInputOpen] = useState(true);
-  const [catalogEditOpen, setCatalogEditOpen] = useState(false);
-  const [catalogDraft, setCatalogDraft] = useState(null);
   const [inputDate, setInputDate] = useState(yesterday);
   const [inputOwner, setInputOwner] = useState(() => localStorage.getItem('kpi_owner_bunghal') || '');
   const [editingEntryId, setEditingEntryId] = useState(null); // 편집 중인 항목 ID (owner 변경 시 신규 생성 방지)
@@ -4661,10 +4698,9 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
     try {
       const base64 = photoDataUrl.split(',')[1];
       const mimeType = photoDataUrl.match(/^data:(.+);base64/)?.[1] || 'image/png';
-      // 저장된 기록으로 보강한 사전 + 오인식으로 판단되는 교정만 사용
+      // 저장된 기록으로 보강한 사전 사용
       const recogCatalog = effectiveCatalog(catalog, bunghalLog);
-      const corrections = usefulCorrections(data.bunghalCorrections, recogCatalog);
-      const prompt = buildBunghalPrompt(recogCatalog, corrections);
+      const prompt = buildBunghalPrompt(recogCatalog);
       const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -4788,119 +4824,6 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
     localStorage.setItem('kpi_owner_bunghal', name);
   };
 
-  const CATALOG_LISTS = [
-    { key: 'products',  label: '품목',     ph: '이브닝, 쿠시노, …' },
-    { key: 'causes',    label: '원인',     ph: '봉탈, 오염, …' },
-    { key: 'owners',    label: '작업자',   ph: '인터 #1, 인터 #2' },
-    { key: 'sizes',     label: '사이즈',   ph: 'S, SS, Q, K' },
-    { key: 'positions', label: '상/하',    ph: '최상단, 상, 하' },
-    { key: 'origins',   label: '원인공정', ph: '퀼팅, 인터, 업체, 수선' },
-    { key: 'actions',   label: '처리내역', ph: '수선, 폐기' },
-  ];
-
-  // 표기 통일 규칙 <-> 텍스트  ("틀린표기 -> 올바른표기" 한 줄에 하나)
-  const aliasMapToText = (m) => Object.entries(m || {}).map(([k, v]) => `${k} -> ${v}`).join('\n');
-  const aliasTextToMap = (t) => {
-    const out = {};
-    String(t || '').split('\n').forEach(line => {
-      const i = line.indexOf('->');
-      if (i < 0) return;
-      const from = line.slice(0, i).trim();
-      const to = line.slice(i + 2).trim();
-      if (from && to && from !== to) out[from] = to;
-    });
-    return out;
-  };
-
-  const openCatalogEdit = () => {
-    const d = {};
-    CATALOG_LISTS.forEach(f => { d[f.key] = (catalog[f.key] || []).join(', '); });
-    d.aliases = aliasMapToText(catalog.aliases);
-    d.causeAliases = aliasMapToText(catalog.causeAliases);
-    setCatalogDraft(d);
-    setCatalogEditOpen(true);
-  };
-
-  // 저장된 작업일지에서 품목·원인을 채우고, 공백만 다른 표기는 통일 규칙으로 제안한다.
-  // 신제품이 나와도 여기서 한 번 눌러 확인만 하면 된다.
-  const fillCatalogFromRecords = () => {
-    const seen = {};
-    (bunghalLog || []).forEach(e => (e.records || []).forEach(r => {
-      const c = String(r.cause || '').trim();
-      if (c) seen[c] = (seen[c] || 0) + 1;
-    }));
-    const groups = {};
-    Object.keys(seen).forEach(v => {
-      const k = v.replace(/\s+/g, '');
-      (groups[k] = groups[k] || []).push(v);
-    });
-    const proposed = { ...aliasTextToMap(catalogDraft && catalogDraft.causeAliases) };
-    Object.values(groups).forEach(vs => {
-      if (vs.length < 2) return;
-      // 띄어쓰기가 있는 표기를 기준으로, 같으면 더 많이 쓰인 쪽을 기준으로
-      const target = vs.slice().sort((a, b) =>
-        (b.split(' ').length - a.split(' ').length) || (seen[b] - seen[a]))[0];
-      vs.forEach(v => { if (v !== target) proposed[v] = target; });
-    });
-    // 제안한 규칙을 먼저 얹은 사전으로 목록을 뽑아야 표기가 합쳐진 상태로 나온다.
-    // (규칙 적용 전에 뽑으면 "스펀지접힘"과 "스펀지 접힘"이 둘 다 목록에 남는다)
-    const withRules = {
-      ...catalog,
-      aliases:      aliasTextToMap((catalogDraft || {}).aliases),
-      causeAliases: proposed,
-    };
-    const eff = effectiveCatalog(withRules, bunghalLog);
-    setCatalogDraft(d => ({
-      ...d,
-      products: eff.products.join(', '),
-      causes:   eff.causes.join(', '),
-      causeAliases: aliasMapToText(proposed),
-    }));
-    toast('저장된 기록에서 채웠습니다 — 확인하고 저장하세요', 'info');
-  };
-
-  const saveCatalogEdit = () => {
-    const next = { ...catalog };
-    CATALOG_LISTS.forEach(f => {
-      next[f.key] = String((catalogDraft || {})[f.key] || '')
-        .split(',').map(s => s.trim()).filter(Boolean);
-    });
-    if (!next.owners.length) { toast('작업자 1명 이상 필요', 'warn'); return; }
-    if (!next.products.length || !next.causes.length) { toast('품목·원인은 비울 수 없습니다', 'warn'); return; }
-    next.aliases      = aliasTextToMap((catalogDraft || {}).aliases);
-    next.causeAliases = aliasTextToMap((catalogDraft || {}).causeAliases);
-    onSaveCatalog && onSaveCatalog(next);
-    if (!next.owners.includes(inputOwner)) handleSaveOwner(next.owners[0]);
-    setCatalogEditOpen(false);
-    toast('사전 저장 완료', 'success');
-  };
-
-  // 저장된 기록으로 보강한 사전 — 자동완성과 인식에 함께 쓴다
-  const liveCatalog = useMemo(() => effectiveCatalog(catalog, bunghalLog), [catalog, bunghalLog]);
-
-  // 내용이 완전히 같은 행 — Gemini의 이중등록을 잡아낸다
-  const duplicateRows = useMemo(() => {
-    const FIELDS = ['product', 'size', 'position', 'qty', 'cause', 'originProc', 'action'];
-    const first = new Map();
-    const dup = new Set();
-    inputRecords.forEach((r, i) => {
-      const parts = FIELDS.map(f => String(r[f] ?? '').trim());
-      if (!parts.some(Boolean)) return;
-      const k = parts.join('|');
-      if (first.has(k)) dup.add(i); else first.set(k, i);
-    });
-    return dup;
-  }, [inputRecords]);
-
-  // 학습(교정) 데이터 초기화 — 오염된 교정은 선별이 어려워 통째로 비우는 편이 낫다
-  const resetCorrections = async () => {
-    const n = (data.bunghalCorrections || []).length;
-    if (!n) { toast('저장된 학습 데이터가 없습니다', 'info'); return; }
-    if (!await dialog(`사진 인식 학습 데이터 ${n}건을 모두 지울까요?\n\n지운 뒤에는 앞으로의 수정 내용만 다시 쌓입니다.\n작업일지 기록은 지워지지 않습니다.`)) return;
-    onSaveCorrections && onSaveCorrections([]);
-    toast(`학습 데이터 ${n}건 초기화 완료`, 'success');
-  };
-
   const markInputDirty = () => { inputDirtyRef.current = true; };
 
   const addRecord = () => { markInputDirty(); setInputRecords(rs => [...rs, makeEmptyBunghalRecord()]); };
@@ -4987,35 +4910,6 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
     inputDirtyRef.current = false;
     clearBunghalDraft();
     onSaveLog(next);
-
-    // 자가 학습 — 인식 결과와 사람이 고친 결과의 차이를 누적.
-    // 짝은 반드시 _id로 맞춘다. 인덱스로 맞추면 사용자가 행을 하나만 지워도 이후 행이 전부 밀려
-    // "수선"→"폐기" 같은 가짜 교정이 대량 생성되고, 그게 다음 인식 프롬프트를 오염시킨다.
-    if (originalRecords.length && onSaveCorrections) {
-      const origById = new Map(originalRecords.map(r => [r._id, r]));
-      const diffs = [];
-      const seen = new Set();
-      inputRecords.forEach(cur => {
-        const orig = origById.get(cur._id);
-        if (!orig) return; // 사용자가 새로 추가한 행 — 비교 대상 없음
-        // 품목·원인만 학습한다. 사이즈·위치·공정·처리는 인식 결과가 항상 사전 값이라
-        // 값이 달라졌다면 글자 오인식이 아니라 사람의 판단 변경이다.
-        ['product', 'cause'].forEach(field => {
-          const o = String(orig[field] || '').trim();
-          const c = String(cur[field] || '').trim();
-          if (o && c && o !== c && !seen.has(`${field}:${o}→${c}`)) {
-            diffs.push({ field, wrong: o, correct: c, date: new Date().toISOString() });
-            seen.add(`${field}:${o}→${c}`);
-          }
-        });
-      });
-      if (diffs.length) {
-        const prev = data.bunghalCorrections || [];
-        // 최근 100개만 유지
-        const merged = [...prev, ...diffs].slice(-100);
-        onSaveCorrections(merged);
-      }
-    }
 
     // 일간 KPI 자동 동기화 — quiltingDefect / interlockDefect
     syncDailyKpiFromBunghal(next, inputDate);
@@ -5590,9 +5484,9 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
               <option value="">선택</option>
               {(catalog.owners || []).map(o => <option key={o} value={o}>{o}</option>)}
             </select>
-            <button onClick={openCatalogEdit}
-              title="사전 편집 — 품목·원인·작업자·표기 통일"
-              className="text-slate-400 hover:text-slate-700 text-xs leading-none">✎</button>
+            <a href="#/codes"
+              title="공통코드 관리 — 품목·사이즈·상하·원인·원인공정·처리내역·작업자"
+              className="text-slate-400 hover:text-slate-700 text-xs leading-none">✎</a>
           </div>
             );
           })()}
@@ -5601,59 +5495,6 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
               등록됨 · {currentEntry.records?.length || 0}건
             </span>
-          )}
-          {catalogEditOpen && catalogDraft && (
-            <div className="basis-full mt-2 p-4 bg-white border border-slate-200 rounded-lg animate-slide-down">
-              <div className="flex items-center justify-between mb-3">
-                <div className="text-xs font-bold text-slate-700">사전 편집</div>
-                <button onClick={fillCatalogFromRecords}
-                  title="저장된 작업일지에 실제로 쓰인 품목·원인을 채우고, 띄어쓰기만 다른 표기는 통일 규칙으로 제안합니다"
-                  className="text-[10px] px-2.5 py-1 rounded border border-slate-200 text-slate-600 hover:bg-slate-50 font-semibold">
-                  저장된 기록에서 채우기
-                </button>
-              </div>
-
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-x-4 gap-y-2.5">
-                {CATALOG_LISTS.map(f => (
-                  <div key={f.key} className={f.key === 'products' || f.key === 'causes' ? 'lg:col-span-2' : ''}>
-                    <label className="block text-[10px] text-slate-500 font-semibold mb-1">
-                      {f.label} <span className="text-slate-400 font-normal">· 콤마로 구분</span>
-                    </label>
-                    <input type="text" value={catalogDraft[f.key] || ''}
-                      onChange={e => setCatalogDraft(d => ({ ...d, [f.key]: e.target.value }))}
-                      placeholder={f.ph}
-                      className="w-full px-2 py-1.5 text-xs border border-slate-200 rounded focus:outline-none focus:ring-2 focus:ring-violet-300" />
-                  </div>
-                ))}
-              </div>
-
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mt-3">
-                {[{ key: 'aliases', label: '품목 표기 통일', ph: '데일리 투인원 -> 투인원' },
-                  { key: 'causeAliases', label: '원인 표기 통일', ph: '구멍 -> 원단구멍' }].map(f => (
-                  <div key={f.key}>
-                    <label className="block text-[10px] text-slate-500 font-semibold mb-1">
-                      {f.label} <span className="text-slate-400 font-normal">· 한 줄에 하나, {'"'}틀린표기 -&gt; 올바른표기{'"'}</span>
-                    </label>
-                    <textarea rows={5} value={catalogDraft[f.key] || ''}
-                      onChange={e => setCatalogDraft(d => ({ ...d, [f.key]: e.target.value }))}
-                      placeholder={f.ph}
-                      className="w-full px-2 py-1.5 text-xs border border-slate-200 rounded font-mono focus:outline-none focus:ring-2 focus:ring-violet-300" />
-                  </div>
-                ))}
-              </div>
-
-              <div className="text-[10px] text-slate-400 mt-2.5 leading-relaxed">
-                여기에 없는 품목·원인이라도 작업일지에 {CATALOG_AUTO_MIN_COUNT}회 이상 저장되면 사진 인식 사전에 자동으로 포함됩니다.
-                이 화면은 그 결과를 확인·수정하거나, 신제품을 미리 등록할 때 씁니다.
-              </div>
-
-              <div className="flex items-center gap-2 mt-3">
-                <button onClick={saveCatalogEdit}
-                  className="px-3 py-1.5 text-[10px] font-semibold rounded bg-violet-500 hover:bg-violet-600 text-white">저장</button>
-                <button onClick={() => setCatalogEditOpen(false)}
-                  className="px-2.5 py-1.5 text-[10px] rounded bg-slate-100 hover:bg-slate-200 text-slate-600">취소</button>
-              </div>
-            </div>
           )}
         </div>
         {inputOpen && (
@@ -5674,11 +5515,6 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
                   </button>
                   <input ref={fileRef} type="file" accept="image/*" className="hidden"
                     onChange={e => { const f = e.target.files?.[0]; if (f) onPickFile(f); e.target.value = ''; }} />
-                  <button onClick={resetCorrections}
-                    title="인식 결과를 고친 내용이 학습 데이터로 쌓입니다. 인식이 계속 엉뚱하면 초기화하세요."
-                    className="text-[11px] px-2 py-1 rounded text-slate-500 hover:bg-slate-100">
-                    학습 {(data.bunghalCorrections || []).length}건
-                  </button>
                   <button onClick={() => fileRef.current?.click()}
                     className="text-[11px] px-2 py-1 rounded text-slate-600 hover:bg-slate-100">파일 선택</button>
                   {photoDataUrl && (
@@ -8532,6 +8368,248 @@ function UploadGroupCard({ g, onDeleteGroup, onDeleteReport }) {
           </table>
         </div>
       )}
+    </div>
+  );
+}
+
+/* ============================================================
+   24-C) CODE MASTER — 공통코드 관리
+   ============================================================ */
+function CodeMasterPage({ data, onSave }) {
+  const toast = useToast();
+  const dialog = useConfirm();
+  const catalog = data.productCatalog || DEFAULT_PRODUCT_CATALOG;
+  const bunghalLog = data.bunghalLog || [];
+
+  const [group, setGroup] = useState(CODE_GROUPS[0].key);
+  const [draft, setDraft] = useState(() => toCodeMaster(catalog));
+  const [dirty, setDirty] = useState(false);
+  const dirtyRef = useRef(false);
+
+  useEffect(() => registerDirtyCheck(() => dirtyRef.current), []);
+
+  const touch = (next) => { dirtyRef.current = true; setDirty(true); setDraft(next); };
+
+  // 저장된 작업일지 기준 실제 사용 횟수 — 어떤 코드가 살아있고 죽었는지 보인다
+  const usage = useMemo(() => {
+    const m = {};
+    const bump = (k, v) => {
+      const s = String(v || '').trim();
+      if (!s) return;
+      m[k] = m[k] || {};
+      m[k][s] = (m[k][s] || 0) + 1;
+    };
+    bunghalLog.forEach(e => {
+      (e.records || []).forEach(r => {
+        bump('product', r.product); bump('cause', r.cause); bump('size', r.size);
+        bump('position', r.position); bump('origin', r.originProc); bump('action', r.action);
+      });
+      (e.productionRecords || []).forEach(r => {
+        bump('product', r.product); bump('size', r.size); bump('position', r.position);
+      });
+      bump('owner', e.owner);
+    });
+    return m;
+  }, [bunghalLog]);
+
+  const gdef  = CODE_GROUPS.find(g => g.key === group) || CODE_GROUPS[0];
+  const items = draft[group] || [];
+  const used  = usage[group] || {};
+  const countOf = (it) =>
+    (used[it.code] || 0) + (it.aliases || []).reduce((s, a) => s + (used[a] || 0), 0);
+
+  const setItems = (fn) => touch({ ...draft, [group]: fn(items) });
+  const updateItem = (i, patch) => setItems(rs => rs.map((r, j) => j === i ? { ...r, ...patch } : r));
+  const addItem = () => setItems(rs => [...rs, { code: '', aliases: [], active: true }]);
+  const move = (i, d) => setItems(rs => {
+    const j = i + d;
+    if (j < 0 || j >= rs.length) return rs;
+    const out = rs.slice();
+    const t = out[i]; out[i] = out[j]; out[j] = t;
+    return out;
+  });
+  const removeItem = async (i) => {
+    const it = items[i];
+    const n = countOf(it);
+    if (n > 0 && !await dialog(
+      `"${it.code}" 는 저장된 기록에 ${n}건 쓰였습니다.\n` +
+      `삭제해도 과거 기록은 그대로 남지만 목록·자동완성에서는 사라집니다.\n\n` +
+      `더 안 쓰는 코드라면 삭제보다 "사용" 체크를 끄는 편이 안전합니다.\n삭제할까요?`)) return;
+    setItems(rs => rs.filter((_, j) => j !== i));
+  };
+
+  // 저장된 기록에 실제로 쓰였는데 코드에 없는 값을 가져온다.
+  // 공백만 다른 표기는 새 코드가 아니라 기존 코드의 "다른 표기"로 붙인다.
+  const fillFromRecords = () => {
+    const squash = (s) => s.replace(/\s+/g, '');
+    const next = items.map(x => ({ ...x, aliases: [...(x.aliases || [])] }));
+    const known = new Set(next.map(x => x.code));
+    const owned = new Set(next.reduce((a, x) => a.concat(x.aliases), []));
+    let added = 0, merged = 0;
+    Object.keys(used)
+      .filter(v => !known.has(v) && !owned.has(v) && used[v] >= CATALOG_AUTO_MIN_COUNT)
+      .filter(v => group !== 'product' || looksLikeProductCode(v))
+      .sort((a, b) => used[b] - used[a])
+      .forEach(v => {
+        const hit = next.find(x => squash(x.code) === squash(v));
+        if (hit) { hit.aliases.push(v); merged++; return; }
+        next.push({ code: v, aliases: [], active: true });
+        added++;
+      });
+    if (!added && !merged) { toast('가져올 코드가 없습니다', 'info'); return; }
+    touch({ ...draft, [group]: next });
+    toast(`코드 ${added}건 추가 · 표기 ${merged}건 병합 — 확인 후 저장하세요`, 'info');
+  };
+
+  const revert = () => {
+    setDraft(toCodeMaster(catalog));
+    dirtyRef.current = false;
+    setDirty(false);
+  };
+
+  const save = () => {
+    const cleaned = {};
+    for (const g of CODE_GROUPS) {
+      const list = (draft[g.key] || []).map(x => ({
+        code: String(x.code || '').trim(),
+        aliases: [...new Set((x.aliases || []).map(a => String(a).trim()).filter(Boolean))],
+        active: x.active !== false,
+      })).filter(x => x.code);
+      const seen = new Set();
+      for (const x of list) {
+        if (seen.has(x.code)) { toast(`${g.label}: "${x.code}" 코드가 중복됩니다`, 'warn'); return; }
+        seen.add(x.code);
+      }
+      if (!list.some(x => x.active)) { toast(`${g.label}: 사용 중인 코드가 하나도 없습니다`, 'warn'); return; }
+      cleaned[g.key] = list;
+    }
+    onSave(applyCodeMaster(catalog, cleaned));
+    setDraft(cleaned);
+    dirtyRef.current = false;
+    setDirty(false);
+    toast('공통코드 저장 완료', 'success');
+  };
+
+  const btn = 'px-3 py-1.5 text-xs font-semibold rounded-lg flex items-center gap-1.5';
+
+  return (
+    <div className="space-y-5">
+      <div className="flex items-center justify-between gap-2 flex-wrap animate-fade-up">
+        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-1.5 inline-flex gap-1 flex-wrap">
+          {CODE_GROUPS.map(g => {
+            const n = (draft[g.key] || []).filter(x => x.active !== false).length;
+            const on = group === g.key;
+            return (
+              <button key={g.key} onClick={() => setGroup(g.key)}
+                className={`px-3 py-2 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors ${on ? 'bg-slate-800 text-white' : 'text-slate-600 hover:bg-slate-100'}`}>
+                {g.label}
+                <span className={`num text-[10px] ${on ? 'text-white/60' : 'text-slate-400'}`}>{n}</span>
+              </button>
+            );
+          })}
+        </div>
+        <div className="flex items-center gap-2">
+          {dirty && (
+            <span className="text-[11px] font-bold text-amber-600 flex items-center gap-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-500"></span>저장 안 됨
+            </span>
+          )}
+          <button onClick={revert} disabled={!dirty}
+            className={`${btn} border border-slate-200 ${dirty ? 'text-slate-600 hover:bg-slate-50' : 'text-slate-300 cursor-not-allowed'}`}>
+            되돌리기
+          </button>
+          <button onClick={save}
+            className={`${btn} bg-gradient-to-r from-slate-700 to-slate-800 text-white hover:from-slate-800 hover:to-slate-900 shadow-md`}>
+            <Icon name="check" size={14} />저장
+          </button>
+        </div>
+      </div>
+
+      <Card>
+        <CardHeader
+          title={`${gdef.label} 코드`}
+          sub={gdef.alias
+            ? '사진 인식·자동완성이 함께 쓰는 목록입니다. 다른 표기는 이 코드로 통일됩니다.'
+            : '사진 인식·자동완성이 함께 쓰는 목록입니다.'}
+          right={
+            <button onClick={fillFromRecords}
+              title={`저장된 작업일지에 ${CATALOG_AUTO_MIN_COUNT}회 이상 쓰였는데 코드에 없는 값을 가져옵니다`}
+              className={`${btn} border border-slate-200 text-slate-600 hover:bg-slate-50`}>
+              <Icon name="upload" size={13} />저장된 기록에서 가져오기
+            </button>
+          } />
+        <div className="p-5">
+          <div className="overflow-x-auto border border-slate-200 rounded-lg">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="bg-slate-50 text-slate-500">
+                  <th className="px-2 py-2 text-center font-semibold w-[70px]">순서</th>
+                  <th className="px-2 py-2 text-center font-semibold w-[180px]">코드</th>
+                  <th className="px-2 py-2 text-center font-semibold">
+                    다른 표기 {gdef.alias ? '' : '(이 그룹은 미사용)'}
+                  </th>
+                  <th className="px-2 py-2 text-center font-semibold w-[60px]">사용</th>
+                  <th className="px-2 py-2 text-center font-semibold w-[80px]">기록 건수</th>
+                  <th className="px-2 py-2 w-[40px]"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {items.length === 0 && (
+                  <tr><td colSpan={6} className="px-3 py-8 text-center text-slate-400">코드를 추가하세요.</td></tr>
+                )}
+                {items.map((it, i) => {
+                  const n = countOf(it);
+                  const off = it.active === false;
+                  return (
+                    <tr key={i} className={`border-t border-slate-100 ${off ? 'bg-slate-50/70 text-slate-400' : 'hover:bg-slate-50/40'}`}>
+                      <td className="px-2 py-1 text-center whitespace-nowrap">
+                        <button onClick={() => move(i, -1)} disabled={i === 0}
+                          className={`px-1 ${i === 0 ? 'text-slate-200' : 'text-slate-400 hover:text-slate-700'}`}>▲</button>
+                        <button onClick={() => move(i, 1)} disabled={i === items.length - 1}
+                          className={`px-1 ${i === items.length - 1 ? 'text-slate-200' : 'text-slate-400 hover:text-slate-700'}`}>▼</button>
+                      </td>
+                      <td className="px-1 py-1">
+                        <input type="text" value={it.code}
+                          onChange={e => updateItem(i, { code: e.target.value })}
+                          placeholder="코드값"
+                          className="w-full px-2 py-1 border border-transparent hover:border-slate-200 rounded text-xs text-center font-semibold focus:outline-none focus:ring-2 focus:ring-slate-300" />
+                      </td>
+                      <td className="px-1 py-1">
+                        <input type="text"
+                          value={(it.aliases || []).join(', ')}
+                          onChange={e => updateItem(i, { aliases: e.target.value.split(',').map(s => s.trim()).filter(Boolean) })}
+                          disabled={!gdef.alias}
+                          placeholder={gdef.alias ? '콤마로 구분 — 이 표기로 적혀 있으면 위 코드로 바뀝니다' : ''}
+                          className="w-full px-2 py-1 border border-transparent hover:border-slate-200 rounded text-xs focus:outline-none focus:ring-2 focus:ring-slate-300 disabled:bg-transparent disabled:placeholder-transparent" />
+                      </td>
+                      <td className="px-2 py-1 text-center">
+                        <input type="checkbox" checked={it.active !== false}
+                          onChange={e => updateItem(i, { active: e.target.checked })}
+                          title="끄면 자동완성·사진 인식 목록에서 빠집니다 (과거 기록은 유지)"
+                          className="w-3.5 h-3.5 align-middle accent-slate-700" />
+                      </td>
+                      <td className={`px-2 py-1 text-center num ${n === 0 ? 'text-slate-300' : ''}`}>{n}</td>
+                      <td className="px-2 py-1 text-center">
+                        <button onClick={() => removeItem(i)}
+                          className="text-slate-400 hover:text-rose-600 text-base leading-none">×</button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="flex items-center justify-between mt-2.5">
+            <button onClick={addItem}
+              className="text-[11px] px-2.5 py-1.5 rounded text-slate-600 hover:bg-slate-100 font-semibold">+ 코드 추가</button>
+            <div className="text-[10px] text-slate-400 text-right leading-relaxed">
+              사용을 끄면 과거 기록은 그대로 두고 목록에서만 빠집니다 — 단종 품목은 삭제보다 이쪽이 안전합니다.<br />
+              코드에 없는 값도 작업일지에 {CATALOG_AUTO_MIN_COUNT}회 이상 저장되면 사진 인식 사전에 자동으로 포함됩니다.
+            </div>
+          </div>
+        </div>
+      </Card>
     </div>
   );
 }

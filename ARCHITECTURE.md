@@ -131,7 +131,6 @@ CREATE TABLE IF NOT EXISTS kpidb (
 | `weeklyJournal`   | `{[weekKey]: {[proc]: {[owner]: string}}}`                 | 주간 기록 (담당자별 자유 메모)     |
 | `bunghalLog`      | `BunghalEntry[]`                                           | 작업일지 (생산+부적합) · date+owner unique key |
 | `productCatalog`  | `{products, sizes, positions, aliases, causes, origins, actions, owners}` | 봉탈 기록 사전 (자동완성·Gemini 프롬프트) |
-| `bunghalCorrections` | `[{field, wrong, correct, date}]` (최근 100건)         | Gemini 자가 학습 — 오인식 교정 누적 |
 | `geminiApiKey`    | `string`                                                   | Gemini Vision API 키 (팀 공유 — 누구나 *사용* 가능) |
 | `geminiPassHash`  | `string` (SHA-256 hex)                                     | API 키 관리용 비밀번호 해시 (팀 공유 — *조회·변경·삭제* 인증) |
 | `priceMaster`     | `[]`                                                       | (구) 단가 마스터 · 호환 보존 미사용|
@@ -440,7 +439,7 @@ grd_list_YYYYMMDDHHMMSS.xls
 gemini-2.5-flash (Vision)
        │  [이미지 전처리] compressImageDataUrl — 최대 1500px · JPEG 85% 압축
        │    휴대폰 사진 5~8MB → 200~400KB, 업로드·처리 시간 대폭 단축
-       │  프롬프트: catalog 사전 + alias + 축약 규칙 + 시간 블록 규칙 + corrections 컨텍스트
+       │  프롬프트: 공통코드 사전 + 표기규칙 + 축약 규칙 + 시간 블록 규칙 + 행 독립 규칙
        │  응답: { meta:{date,owner}, production:[...], defects:[...] }
        │  오류 시: HTTP 상태 코드별 한국어 안내 메시지
        │    400 → "API 키가 잘못됐거나 이미지 형식이 지원되지 않습니다."
@@ -459,7 +458,7 @@ gemini-2.5-flash (Vision)
 [저장]
    ├─ bunghalLog에 BunghalEntry 저장 (date+owner unique key)
    ├─ 자동 동기화 — production entry의 quiltingDefect/interlockDefect 자동 계산·갱신
-   └─ 사용자 수정분 → bunghalCorrections 누적 (다음 인식 컨텍스트)
+   └─ entry.recogStats 에 인식 대비 수정량 기록 (정확도 측정용)
 ```
 
 **등록된 작업일지 이력 표 컬럼 구성**
@@ -484,7 +483,7 @@ gemini-2.5-flash (Vision)
   - `"HH:MM -"` (시작 시간만) → 새 블록 시작, 이후 시간 공백 행은 같은 블록
   - 블록 내 마지막/단독 `"HH:MM"` → 해당 블록의 종료시간
   - 같은 블록의 모든 행 `time = "시작-종료"` (예: `"13:00-17:05"`)
-- 최근 30건 corrections를 *"이전 오인식 — 같은 오류 반복 금지"* 컨텍스트로 주입
+- 행 독립 판단·중복 행 금지·빈칸은 축약 기호가 아님 규칙을 명시
 
 **인식 사전 — 손으로 관리하지 않는다**
 
@@ -510,25 +509,44 @@ gemini-2.5-flash (Vision)
 치환은 **값 전체가 정확히 일치할 때만** 일어난다. 부분 치환은
 `"데일리라이트"` → `"데일리데일리라이트"` 같은 사고를 낸다 (구 `normalizeProductName`의 버그).
 
-**사전 편집 UI** (봉탈 기록 화면 작업자 옆 ✎)
+**공통코드 관리** (`#/codes` · 봉탈 기록 화면 작업자 옆 ✎)
 
-품목·원인·작업자·사이즈·상하·원인공정·처리내역 목록과 표기 통일 규칙을 편집한다.
-**"저장된 기록에서 채우기"** 는 `bunghalLog`에서 실사용 값을 끌어오고,
-공백만 다른 표기(`스펀지접힘` / `스펀지 접힘`)를 찾아 통일 규칙으로 함께 제안한다.
-규칙을 먼저 얹은 사전으로 목록을 계산하므로 통일된 표기 하나만 남는다.
+품목·사이즈·상하·원인·원인공정·처리내역·작업자를 한 화면에서 관리한다.
 
-의미가 달라 기계가 판단할 수 없는 규칙(`구멍` → `원단구멍`, `미달` → `사이즈 미달`)은
-사용자가 이 화면에서 한 번 입력한다.
+| 개념 | 내용 |
+|------|------|
+| 코드 | 그룹별 항목. 순서 변경 가능 |
+| 다른 표기 | 이 코드로 통일할 표기들. 품목·원인 그룹만 사용 |
+| 사용 | 끄면 평면 배열에서 빠져 자동완성·인식 사전에서 제외. **과거 기록은 그대로** |
+| 기록 건수 | `bunghalLog` 기준 실제 사용 횟수 (별칭 포함). 죽은 코드가 보인다 |
 
-**자가 학습 — 짝은 반드시 `_id`로 맞춘다**
+저장 구조는 `catalog.codes[group] = [{code, aliases, active}]`이고,
+`applyCodeMaster()`가 저장 시 평면 배열(`products`/`causes`/…)과 표기 규칙(`aliases`/`causeAliases`)을
+함께 다시 만들어 준다. 그래서 나머지 화면은 예전 구조 그대로 동작한다.
+`toCodeMaster()`는 `codes`가 없는 구버전 사전도 평면 배열에서 복원한다.
 
-인덱스로 맞추면 사용자가 행 하나만 지워도 이후 행이 전부 밀려 **가짜 교정이 대량 생성**된다.
-실측: 가짜 행 1줄 삭제 → 교정 11건 생성(전부 거짓) → 최근 30건 주입 창이 세 번이면 100% 오염.
+**"저장된 기록에서 가져오기"** 는 `bunghalLog`에서 `CATALOG_AUTO_MIN_COUNT`회 이상 쓰였는데
+코드에 없는 값을 가져온다. 공백만 다른 표기(`스펀지접힘` / `스펀지 접힘`)는 새 코드가 아니라
+기존 코드의 별칭으로 붙인다. 의미가 달라 기계가 판단할 수 없는 규칙(`구멍` → `원단구멍`)은
+사용자가 별칭 칸에 직접 적는다.
 
-- 짝 맞춤: `_id` (삭제·삽입에 영향 없음)
-- 학습 대상: `product`·`cause`만. 사이즈·위치·공정·처리는 실데이터가 100% 사전 값이라
-  값이 달라졌다면 글자 오인식이 아니라 사람의 판단 변경이다
-- `usefulCorrections()`가 주입 직전에 한 번 더 거른다 — `wrong`이 이미 사전에 있는 정상값이면 제외
+`effectiveCatalog()`는 `active: false`인 코드를 자동 편입에서 제외한다 — 꺼둔 코드가 되살아나지 않는다.
+
+**자가 학습(`bunghalCorrections`)은 제거했다**
+
+인식 결과와 수정본의 짝을 인덱스로 맞추는 버그가 있어, 사용자가 이중등록 행을 하나만 지워도
+이후 행이 전부 밀려 가짜 교정이 대량 생성됐다. 실측: 가짜 행 1줄 삭제 → 거짓 교정 11건.
+운영 데이터 100건 중 83건이 오염, 프롬프트 주입분의 77%가 거짓이었다.
+
+`_id` 매칭으로 고친 뒤 값어치를 실측한 결과 **유지할 이유가 없었다**.
+
+- 55일간 같은 오인식이 반복된 횟수 **0회** — 반복을 전제한 구조인데 반복이 없다
+- 반복되는 것은 오독 형태가 아니라 *오독당하는 단어*였다
+  (`구멍`은 `"고정"`·`"고명"` 두 형태로 잘못 읽힘)
+- 교정 17건 중 13건은 정답이 이미 사전에 있어 **사전 fuzzy match만으로 잡혔을 것**
+- 즉 교정이 하려던 일을 `effectiveCatalog`의 사전 자동 확장이 더 잘한다
+
+오염되면 `originProc`·`action`이 뒤집혀 봉탈률 KPI까지 틀어지므로, 이득 없는 위험이었다.
 
 **인식 정확도 계측**
 
@@ -620,7 +638,7 @@ App                       — 라우팅 · 전역 상태 · 서버 동기화 · 
 │   ├ ProductionSummaryTab  — 일별/주별/월별/기간/전체 토글 (주차·월 selector 대시보드 패턴) + KpiMatrix
 │   │   └ KpiMatrix          — KPI × 시점 표 (라인 차트 대신, status 컬러 셀)
 │   ├ BunghalAnalysisTab    — 두 모드 (mode prop 분기)
-│   │   ├ mode='record'      — 작업일지 사진 인식 + 두 표 입력 + 등록 이력 + 자가 학습
+│   │   ├ mode='record'      — 작업일지 사진 인식 + 두 표 입력 + 등록 이력
 │   │   │   ├ BunghalKpiCard / BunghalTrendChart / BunghalDonutChart — 차트 컴포넌트
 │   │   │   └ Gemini Vision 연동 — gemini-2.5-flash + 이미지 압축 + catalog 사전 주입
 │   │   └ mode='analysis'    — KPI 5장 + 추세 라인 + 도넛 2개 + 원인/품목/불량률 Top
@@ -788,7 +806,8 @@ docker run -d -p 8000:8000 -e DATABASE_URL="postgresql://..." kpi-dashboard
 - **새 페이지 추가** — `useHashRoute` 라우트 분기 + `PAGE_META` 등록
 - **기간 선택 UI** — 새 화면이 시작·종료일이 필요하면 `DateRangePicker` 컴포넌트 재사용 (`{startDate, endDate, onChange, min, max}` props)
 - **봉탈 사전 항목 추가** — `productCatalog`(products/sizes/positions/causes/origins/actions/owners)에 추가하면 즉시 자동완성·Gemini 프롬프트에 반영. 작업자 추가는 ✎ inline 편집기로 가능
-- **새 Vision 인식 화면** — Gemini API 키는 `localStorage('kpi_gemini_key')` 공유. `buildBunghalPrompt` 패턴 재활용 가능 (사전 + 축약 규칙 + corrections)
+- **새 Vision 인식 화면** — Gemini API 키는 서버 DB 공유. `buildBunghalPrompt` 패턴 재활용 가능 (공통코드 사전 + 축약 규칙 + 행 독립 규칙)
+- **공통코드 그룹 추가** — `CODE_GROUPS`에 `{key, label, list, alias?}` 한 줄 추가하면 관리 화면·저장 구조가 함께 따라온다
 - **저장 키 추가** — `STORE_KEYS` + App state·`pullFB`·`saveXxx` 핸들러 (3중 등록)
 - **담당자 추가** — `JOURNAL_OWNERS`에 공정별 이름 추가
 - **주간 기록 시작점 변경** — `JOURNAL_START_YEAR` / `JOURNAL_START_WEEK` 상수만 수정
