@@ -1101,6 +1101,7 @@ const PAGE_META = {
   '/production/settings': { title: '생산팀 목표 설정',  sub: '5개 KPI의 목표·주의·경고 임계값',    tag: 'PRODUCTION · SETTINGS', accent: 'sky' },
   '/quality':             { title: '품질보증팀 입력',   sub: '퀼팅 공정 부적합 현황 일별 집계',     tag: 'QUALITY',    accent: 'rose' },
   '/quality/settings':    { title: '품질보증팀 목표 설정', sub: '월 누적 부적합·손실 상한 기준',     tag: 'QUALITY · SETTINGS',    accent: 'rose' },
+  // 생산팀 화면의 '공통코드' 탭과 같은 화면. URL 로 바로 들어오는 경우를 위해 남겨둔다.
   '/codes':               { title: '공통코드 관리',     sub: '품목·사이즈·상하·원인·원인공정·처리내역·작업자', tag: 'MASTER DATA', accent: 'slate' },
 };
 
@@ -1117,8 +1118,7 @@ function TopBar({ route, navigate, lastSync, syncing, pending = 0 }) {
     : '연결 중…';
 
   // 페이지별 우측 네비 정의
-  const inCodes    = route === '/codes';
-  const inProd     = route === '/production' || route === '/production/settings' || inCodes;
+  const inProd     = route === '/production' || route === '/production/settings';
   const inQual     = route === '/quality'    || route === '/quality/settings';
   const inSettings = route.endsWith('/settings');
 
@@ -1145,10 +1145,6 @@ function TopBar({ route, navigate, lastSync, syncing, pending = 0 }) {
           {inProd && (
             <Fragment>
               <NavBtn onClick={() => navigate('/quality')} accent="rose" icon={<Icon name="shield" size={16} />} label="품질보증팀" />
-              <NavBtn onClick={() => navigate(inCodes ? '/production' : '/codes')}
-                accent={inCodes ? 'slate-active' : 'slate'}
-                icon={<Icon name={inCodes ? 'pencil' : 'notebook'} size={16} />}
-                label={inCodes ? '입력 화면' : '공통코드'} />
               <NavBtn
                 onClick={() => navigate(inSettings ? '/production' : '/production/settings')}
                 accent={inSettings ? 'slate-active' : 'sky'}
@@ -3355,6 +3351,8 @@ function ProductionPage({ data, onSave, onSaveTrash, onSaveJournal, onSaveCatalo
           <ProductionTabBtn active={tab==='bunghalRecord'} onClick={() => setTab('bunghalRecord')} icon="pencil" label="봉탈 기록" />
           <ProductionTabBtn active={tab==='bunghal'} onClick={() => setTab('bunghal')} icon="shield"    label="봉탈 분석" />
           <ProductionTabBtn active={tab==='history'} onClick={() => setTab('history')} icon="upload"    label="작성 이력" />
+          <span className="w-px self-stretch my-1 bg-slate-200"></span>
+          <ProductionTabBtn active={tab==='codes'}   onClick={() => setTab('codes')}   icon="notebook"  label="공통코드" tone="slate" />
         </div>
         {tab === 'input' && (
           <div className="flex items-center gap-2 flex-wrap">
@@ -3379,17 +3377,22 @@ function ProductionPage({ data, onSave, onSaveTrash, onSaveJournal, onSaveCatalo
       {tab === 'summary' && <ProductionSummaryTab data={data} />}
       {/* 기록·분석은 같은 컴포넌트를 mode만 바꿔 재사용 — 같은 JSX 위치를 유지해야 탭을 오가도 입력 중인 표가 살아남는다 */}
       {(tab === 'bunghalRecord' || tab === 'bunghal') &&
-        <BunghalAnalysisTab mode={tab === 'bunghalRecord' ? 'record' : 'analysis'} data={data} onSave={onSave} onSaveLog={onSaveBunghalLog} onSaveCatalog={onSaveCatalog} onSaveGeminiKey={onSaveGeminiKey} onSaveGeminiPassHash={onSaveGeminiPassHash} />}
+        <BunghalAnalysisTab mode={tab === 'bunghalRecord' ? 'record' : 'analysis'} data={data} onSave={onSave} onSaveLog={onSaveBunghalLog} onSaveCatalog={onSaveCatalog} onOpenCodes={() => setTab('codes')} onSaveGeminiKey={onSaveGeminiKey} onSaveGeminiPassHash={onSaveGeminiPassHash} />}
       {tab === 'history' && <ProductionHistoryTab data={data} onSave={onSave} onSaveTrash={onSaveTrash} />}
+      {tab === 'codes'   && <CodeMasterPage       data={data} onSave={onSaveCatalog} />}
     </div>
   );
 }
 
-function ProductionTabBtn({ active, onClick, icon, label }) {
+function ProductionTabBtn({ active, onClick, icon, label, tone = 'sky' }) {
+  // tone='slate' — 입력 탭이 아니라 설정 성격인 탭 (공통코드)
+  const on = tone === 'slate'
+    ? 'bg-slate-700 text-white shadow shadow-slate-700/20'
+    : 'bg-sky-500 text-white shadow shadow-sky-500/20';
   return (
     <button onClick={onClick}
       className={`px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 transition-colors
-        ${active ? 'bg-sky-500 text-white shadow shadow-sky-500/20' : 'text-slate-500 hover:bg-slate-50'}`}>
+        ${active ? on : 'text-slate-500 hover:bg-slate-50'}`}>
       <Icon name={icon} size={15} />{label}
     </button>
   );
@@ -4536,7 +4539,7 @@ function BunghalDonutChart({ items, palette }) {
   );
 }
 
-function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveGeminiKey, onSaveGeminiPassHash, mode = 'analysis' }) {
+function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onOpenCodes, onSaveGeminiKey, onSaveGeminiPassHash, mode = 'analysis' }) {
   const isRecord = mode === 'record';
   const isAnalysis = mode === 'analysis';
   const toast = useToast();
@@ -5506,9 +5509,9 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveGemi
               <option value="">선택</option>
               {(catalog.owners || []).map(o => <option key={o} value={o}>{o}</option>)}
             </select>
-            <a href="#/codes"
+            <button onClick={() => onOpenCodes && onOpenCodes()}
               title="공통코드 관리 — 품목·사이즈·상하·원인·원인공정·처리내역·작업자"
-              className="text-slate-400 hover:text-slate-700 text-xs leading-none">✎</a>
+              className="text-slate-400 hover:text-slate-700 text-xs leading-none">✎</button>
           </div>
             );
           })()}

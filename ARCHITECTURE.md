@@ -509,7 +509,7 @@ gemini-2.5-flash (Vision)
 치환은 **값 전체가 정확히 일치할 때만** 일어난다. 부분 치환은
 `"데일리라이트"` → `"데일리데일리라이트"` 같은 사고를 낸다 (구 `normalizeProductName`의 버그).
 
-**공통코드 관리** (`#/codes` · 봉탈 기록 화면 작업자 옆 ✎)
+**공통코드 관리** (생산팀 `공통코드` 탭 · 봉탈 기록의 작업자 옆 ✎ · URL `#/codes`)
 
 품목·사이즈·상하·원인·원인공정·처리내역·작업자를 한 화면에서 관리한다.
 
@@ -647,6 +647,7 @@ App                       — 라우팅 · 전역 상태 · 서버 동기화 · 
 │   │   └ KpiMatrix          — KPI × 시점 표 (라인 차트 대신, status 컬러 셀)
 │   ├ BunghalAnalysisTab    — 두 모드 (mode prop 분기)
 │   │   ├ mode='record'      — 작업일지 사진 인식 + 두 표 입력 + 등록 이력
+│   ├ 공통코드      CodeMasterPage       — 품목·원인 등 코드 관리 (#/codes 와 같은 화면)
 │   │   │   ├ BunghalKpiCard / BunghalTrendChart / BunghalDonutChart — 차트 컴포넌트
 │   │   │   └ Gemini Vision 연동 — gemini-2.5-flash + 이미지 압축 + catalog 사전 주입
 │   │   └ mode='analysis'    — KPI 5장 + 추세 라인 + 도넛 2개 + 원인/품목/불량률 Top
