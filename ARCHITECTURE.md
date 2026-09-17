@@ -298,14 +298,18 @@ Object.keys(out).length > 0 일 때만 setData(prev => {...prev, ...out})
 |----|------|------|
 | ① 동기화 | `pickChangedStore` | 내용이 같으면 state 참조를 바꾸지 않음 (5-2) |
 | ② dirty 가드 | `BunghalAnalysisTab` · `ProductionPage` | 사용자가 표를 손댔으면(`inputDirtyRef` / `tasksDirtyRef`) 일자·작업자를 직접 바꾸지 않는 한 폼을 덮어쓰지 않음 |
-| ③ 임시저장 | `kpi_draft_bunghal` | 봉탈 입력은 변경될 때마다 localStorage에 임시저장. 탭 전환·새로고침·브라우저 종료 후 복원 (3일 경과분 폐기, 저장·삭제 시 정리) |
+| ③ 마운트 유지 | `ProductionPage` | 봉탈 화면은 한 번 열면 계속 마운트해 두고 다른 탭에서는 `hidden` 으로 숨기기만 한다 |
 
 추가로:
 
 - **이탈 경고** — `registerDirtyCheck()`로 각 화면이 미저장 여부를 등록하고, App의 `beforeunload`가
   미저장 입력 또는 서버 저장 대기분이 있으면 브라우저 경고를 띄운다
-- **탭 전환 보존** — 봉탈 *기록*과 *분석*은 같은 `BunghalAnalysisTab`을 `mode`만 바꿔 쓴다.
-  JSX 위치가 같아야 React가 언마운트하지 않으므로 반드시 하나의 분기로 렌더한다
+- **탭 전환 보존** — 봉탈 화면은 `bunghalOpened` 이후 계속 렌더하고 `hidden` 으로만 감춘다.
+  언마운트하면 입력 중이던 표가 사라진다. 기록·분석은 같은 컴포넌트를 `mode`만 바꿔 쓴다
+- **임시저장은 두지 않는다** — localStorage 드래프트를 뒀다가 뺐다. 복원이 `inputDirtyRef`를
+  세우면서 기록 effect 가 다시 돌아 `savedAt` 이 갱신됐고, 만료가 영원히 리셋돼
+  옛 입력이 열 때마다 기본값처럼 되살아났다. 탭 전환은 마운트 유지로, 새로고침·종료는
+  `beforeunload` 경고로 충분하다
 - **자동 행 추가** — 마지막 행에 내용이 생기면 빈 행이 자동으로 붙는다 (`rowHasContent`)
 
 > `data.production`은 봉탈 일지 저장(`syncDailyKpiFromBunghal`)으로도 바뀐다. 그래서 일간 입력

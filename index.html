@@ -788,6 +788,9 @@ const __syncRaw = {};
 const __localWriteAt = {};
 const LOCAL_WRITE_GRACE_MS = 8000;
 
+// 제거된 임시저장 기능이 남긴 값 정리 (한 번 지나가면 없어진다)
+try { localStorage.removeItem('kpi_draft_bunghal'); } catch {}
+
 const LS = {
   get: (k, fallback) => {
     try { const v = localStorage.getItem('kpi_' + k); return v ? JSON.parse(v) : fallback; }
@@ -3236,6 +3239,9 @@ function ProductionPage({ data, onSave, onSaveTrash, onSaveJournal, onSaveCatalo
   const [selectedDate, setSelectedDate] = useState(yesterday);
 
   const [tasks, setTasks] = useState(() => emptyTasks());
+  // 봉탈 화면을 한 번이라도 열었는지 — 열고 나면 탭을 옮겨도 마운트를 유지해 입력을 지킨다
+  const bunghalOpened = useRef(false);
+  if (tab === 'bunghalRecord' || tab === 'bunghal') bunghalOpened.current = true;
   const tasksDirtyRef = useRef(false);     // 저장하지 않은 입력이 있는지
   const lastLoadedDateRef = useRef(null);  // 마지막으로 불러온 일자
 
@@ -3375,9 +3381,14 @@ function ProductionPage({ data, onSave, onSaveTrash, onSaveJournal, onSaveCatalo
       {tab === 'input'   && <ProductionInputTab   tasks={tasks} updateTask={updateTask} />}
       {tab === 'journal' && <WeeklyJournalTab     data={data} onSaveJournal={onSaveJournal} />}
       {tab === 'summary' && <ProductionSummaryTab data={data} />}
-      {/* 기록·분석은 같은 컴포넌트를 mode만 바꿔 재사용 — 같은 JSX 위치를 유지해야 탭을 오가도 입력 중인 표가 살아남는다 */}
-      {(tab === 'bunghalRecord' || tab === 'bunghal') &&
-        <BunghalAnalysisTab mode={tab === 'bunghalRecord' ? 'record' : 'analysis'} data={data} onSave={onSave} onSaveLog={onSaveBunghalLog} onSaveCatalog={onSaveCatalog} onOpenCodes={() => setTab('codes')} onSaveGeminiKey={onSaveGeminiKey} onSaveGeminiPassHash={onSaveGeminiPassHash} />}
+      {/* 봉탈 화면은 한 번 열면 계속 마운트해 둔다.
+          언마운트하면 입력 중이던 표가 사라지므로, 다른 탭에 가 있을 때는 숨기기만 한다.
+          기록·분석은 같은 컴포넌트를 mode만 바꿔 쓴다. */}
+      {bunghalOpened.current && (
+        <div hidden={tab !== 'bunghalRecord' && tab !== 'bunghal'}>
+          <BunghalAnalysisTab mode={tab === 'bunghal' ? 'analysis' : 'record'} data={data} onSave={onSave} onSaveLog={onSaveBunghalLog} onSaveCatalog={onSaveCatalog} onOpenCodes={() => setTab('codes')} onSaveGeminiKey={onSaveGeminiKey} onSaveGeminiPassHash={onSaveGeminiPassHash} />
+        </div>
+      )}
       {tab === 'history' && <ProductionHistoryTab data={data} onSave={onSave} onSaveTrash={onSaveTrash} />}
       {tab === 'codes'   && <CodeMasterPage       data={data} onSave={onSaveCatalog} />}
     </div>
@@ -4135,30 +4146,6 @@ function makeEmptyProductionRecord() {
   return { _id: uuid(), product: '', size: '', position: '', qty: '', time: '' };
 }
 
-// 봉탈 입력 임시저장 — 탭 전환·새로고침·브라우저 종료에도 입력이 남도록
-const BUNGHAL_DRAFT_KEY = 'kpi_draft_bunghal';
-const BUNGHAL_DRAFT_TTL_MS = 3 * 24 * 60 * 60 * 1000; // 3일 지나면 폐기
-
-function readBunghalDraft() {
-  try {
-    const raw = localStorage.getItem(BUNGHAL_DRAFT_KEY);
-    if (!raw) return null;
-    const d = JSON.parse(raw);
-    if (!d || !d.savedAt) return null;
-    if (Date.now() - new Date(d.savedAt).getTime() > BUNGHAL_DRAFT_TTL_MS) {
-      localStorage.removeItem(BUNGHAL_DRAFT_KEY);
-      return null;
-    }
-    return d;
-  } catch { return null; }
-}
-function writeBunghalDraft(d) {
-  try { localStorage.setItem(BUNGHAL_DRAFT_KEY, JSON.stringify({ ...d, savedAt: new Date().toISOString() })); } catch {}
-}
-function clearBunghalDraft() {
-  try { localStorage.removeItem(BUNGHAL_DRAFT_KEY); } catch {}
-}
-
 // 행에 입력된 내용이 있는지 — 자동 행 추가 판정용
 function rowHasContent(r) {
   if (!r) return false;
@@ -4587,29 +4574,9 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onOpenCode
   const skipReloadRef = useRef(false);  // 인식 후 헤더 자동 갱신 시 useEffect의 reset 건너뛰기
   const inputDirtyRef = useRef(false);   // 사용자가 입력 표를 직접 손댔는지 — 동기화가 덮어쓰지 못하게 함
   const lastLoadedKeyRef = useRef(null); // 마지막으로 불러온 '일자|작업자' 키
-  const draftNotifiedRef = useRef(false); // 임시저장 복원 안내를 한 번만 띄우기 위함
-  const lastDraftRef = useRef(null);      // 마지막으로 기록한 임시저장 내용
 
   // 새로고침·창 닫기 경고에 이 화면의 미저장 여부를 등록
   useEffect(() => registerDirtyCheck(() => inputDirtyRef.current), []);
-
-  // 입력 중인 내용을 계속 임시저장 — 탭을 옮기거나 새로고침해도 복원된다
-  useEffect(() => {
-    if (!inputDirtyRef.current) return;
-    const payload = {
-      date: inputDate,
-      owner: (inputOwner || '').trim(),
-      records: inputRecords,
-      productionRecords,
-    };
-    const json = JSON.stringify(payload);
-    // 복원 직후처럼 내용이 그대로면 다시 쓰지 않는다.
-    // 다시 쓰면 savedAt 이 갱신돼 3일 만료가 영원히 리셋되고,
-    // 지운 적 없는 옛 입력이 열 때마다 계속 되살아난다.
-    if (lastDraftRef.current === json) return;
-    lastDraftRef.current = json;
-    writeBunghalDraft(payload);
-  }, [inputDate, inputOwner, inputRecords, productionRecords]);
 
   const hasPassword = !!data.geminiPassHash;
 
@@ -4812,47 +4779,8 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onOpenCode
     lastLoadedKeyRef.current = key;
     if (keyChanged) inputDirtyRef.current = false; // 헤더를 직접 바꾼 것이므로 새 entry 기준으로 초기화
     const ex = bunghalLog.find(e => e.date === inputDate && (e.owner || '') === (inputOwner || '').trim());
-    const fromEntry = () => {
-      setInputRecords(ex && ex.records ? ex.records : [makeEmptyBunghalRecord()]);
-      setProductionRecords(ex && ex.productionRecords ? ex.productionRecords : [makeEmptyProductionRecord()]);
-    };
-
-    // 임시저장본이 같은 일자·작업자이고 저장본보다 나중이면 그쪽을 복원한다
-    const draft = readBunghalDraft();
-    const draftFits = draft && draft.date === inputDate && (draft.owner || '') === (inputOwner || '').trim();
-    const draftHasContent = draftFits &&
-      ((draft.records || []).some(rowHasContent) || (draft.productionRecords || []).some(rowHasContent));
-    if (draftFits && !draftHasContent) clearBunghalDraft();   // 빈 껍데기는 남겨둘 이유가 없다
-    const draftNewer = draftHasContent && (!ex || !ex.updatedAt || new Date(draft.savedAt) > new Date(ex.updatedAt));
-
-    if (draftNewer) {
-      const recs  = draft.records && draft.records.length ? draft.records : [makeEmptyBunghalRecord()];
-      const prods = draft.productionRecords && draft.productionRecords.length ? draft.productionRecords : [makeEmptyProductionRecord()];
-      inputDirtyRef.current = true;
-      // 복원한 내용을 그대로 기록해 둬야 임시저장이 스스로 갱신되지 않는다
-      lastDraftRef.current = JSON.stringify({
-        date: inputDate, owner: (inputOwner || '').trim(), records: recs, productionRecords: prods,
-      });
-      setInputRecords(recs);
-      setProductionRecords(prods);
-      if (!draftNotifiedRef.current) {
-        draftNotifiedRef.current = true;
-        toast(`${draft.date} · ${draft.owner || '—'} 의 저장하지 않은 입력을 복원했습니다`, 'info', {
-          duration: 9000,
-          action: {
-            label: '지우기',
-            onClick: () => {
-              clearBunghalDraft();
-              lastDraftRef.current = null;
-              inputDirtyRef.current = false;
-              fromEntry();
-            },
-          },
-        });
-      }
-      return;
-    }
-    fromEntry();
+    setInputRecords(ex && ex.records ? ex.records : [makeEmptyBunghalRecord()]);
+    setProductionRecords(ex && ex.productionRecords ? ex.productionRecords : [makeEmptyProductionRecord()]);
   }, [inputDate, inputOwner, bunghalLog, originalRecords]); // editingEntryId는 의도적으로 deps 제외
 
   const handleSaveOwner = (name) => {
@@ -4961,8 +4889,6 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onOpenCode
       : [...bunghalLog, entry];
     setEditingEntryId(null);
     inputDirtyRef.current = false;
-    lastDraftRef.current = null;
-    clearBunghalDraft();
     onSaveLog(next);
 
     // 일간 KPI 자동 동기화 — quiltingDefect / interlockDefect
@@ -5033,8 +4959,6 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onOpenCode
     setEditingEntryId(null);
     onSaveLog(next);
     inputDirtyRef.current = false;
-    lastDraftRef.current = null;
-    clearBunghalDraft();
     setInputRecords([makeEmptyBunghalRecord()]);
     setProductionRecords([makeEmptyProductionRecord()]);
     setOriginalRecords([]);
@@ -5058,8 +4982,6 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onOpenCode
     setInputOwner(entry.owner || '');
     // records를 직접 로드 (useEffect가 editingEntryId 때문에 skip하므로)
     inputDirtyRef.current = false;
-    lastDraftRef.current = null;
-    clearBunghalDraft();
     lastLoadedKeyRef.current = `${entry.date}|${(entry.owner || '').trim()}`;
     setInputRecords(entry.records?.length ? entry.records : [makeEmptyBunghalRecord()]);
     setProductionRecords(entry.productionRecords?.length ? entry.productionRecords : [makeEmptyProductionRecord()]);
