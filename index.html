@@ -639,44 +639,25 @@ function getAchievement(kpiKey, value, targets) {
    ============================================================ */
 const STORE_KEYS = ['production', 'quality', 'targets', 'qualityTargets', 'erpReports', 'priceMaster', 'erpTrash', 'productionTrash', 'weeklyJournal', 'productCatalog', 'bunghalLog', 'bunghalCorrections', 'geminiApiKey', 'geminiPassHash'];
 
-// 표기 통일 — 같은 불량이 여러 표기로 쪼개지는 것을 막는다.
-// 값 전체가 정확히 일치할 때만 치환한다 (부분 치환은 "데일리라이트"→"데일리데일리라이트" 같은 사고를 낸다)
-const BASE_CAUSE_ALIASES = {
-  '스펀지접힘': '스펀지 접힘',
-  '패턴접힘':   '패턴 접힘',
-  '패딩접힘':   '패딩 접힘',
-  '사이즈미달': '사이즈 미달',
-  '사이즈이단': '사이즈 미달',
-  '미달':       '사이즈 미달',
-  '원단스팟':   '원단 스팟',
-  '워던스팟':   '원단 스팟',
-  '수선불량':   '수선 불량',
-  '구멍':       '원단구멍',
-  '바늘구멍':   '원단구멍',
-  '오영':       '오염',
-};
-const BASE_PRODUCT_ALIASES = {
-  '라이트':        '데일리라이트',
-  '데일리 키즈':   '키즈',
-  '데일리 투인원': '투인원',
-};
 // 저장된 기록에서 이 횟수 이상 쓰인 값은 인식 사전에 자동 편입된다.
 // 사람이 검수해 저장한 값이므로 신뢰할 수 있는 기준.
 const CATALOG_AUTO_MIN_COUNT = 2;
 
-// 봉탈 분석용 품목 사전 — 사용자가 수정 가능
+// 사전의 씨앗값. 실제로 쓰이는 사전은 DB의 productCatalog(화면에서 편집)이고,
+// 여기에 저장된 작업일지의 실사용 값이 자동으로 더해진다(effectiveCatalog).
+// 새 품목·새 불량을 코드에 적을 필요는 없다 — 두 번 저장되면 자동으로 들어간다.
 const DEFAULT_PRODUCT_CATALOG = {
-  products:  ['이브닝', '이브닝 모션', '쿠시노', '데일리', '데일리라이트', '투인원', '뉴문', '하프문', '풀문', '문레이', '선셋', '선라이즈', '시그니처', '키즈', '스타릿', '코코', '누크'],
+  products:  ['이브닝', '쿠시노', '데일리', '데일리라이트', '뉴문', '하프문', '풀문', '문레이', '선셋', '선라이즈', '시그니처', '키즈'],
   sizes:     ['S', 'SS', 'D', 'Q', 'K', 'KK'],
   positions: ['최상단', '상', '하'],
-  aliases:   { '라이트': '데일리라이트' },
-  causes:    ['봉탈', '오염', '스펀지 접힘', '사이즈 미달', '이음부', '재직불량', '원단구멍',
-              '패턴 접힘', '올나감', '잡사', '원단불량', '재단불량', '패턴불량', '원단 스팟',
-              '재단접힘', '수선 불량', '재단미달', '원단접힘', '스펀지 찢김', '원단밀림',
-              '패딩 접힘', '재작업 부족', '원단 부족(수선)', '이물', '기타'],
+  causes:    ['봉탈', '재작업 부족', '스펀지 접힘', '원단 부족(수선)', '오염', '이물', '기타'],
   origins:   ['퀼팅', '인터', '업체', '수선'],
   actions:   ['수선', '폐기'],
   owners:    ['인터 #1', '인터 #2'],
+  // 표기 통일 — 값 전체가 정확히 일치할 때만 치환한다.
+  // (부분 치환은 "데일리라이트"를 "데일리데일리라이트"로 만든다)
+  aliases:      { '라이트': '데일리라이트' },
+  causeAliases: {},
 };
 // UUID 생성 — crypto.randomUUID는 보안 컨텍스트(HTTPS·localhost)에서만 동작한다.
 // 사내망 http://<IP>:8000 접속에서도 행 추가·저장이 되도록 폴백을 둔다.
@@ -4150,12 +4131,16 @@ function applyAlias(raw, map) {
   return (s && map && map[s]) ? map[s] : s;
 }
 
+// 사전에 저장된 규칙만 적용한다. 코드에는 규칙을 두지 않는다 —
+// 규칙을 지우거나 바꾸는 일이 배포 없이 화면에서 끝나야 하기 때문.
 function normalizeProductName(raw, catalog) {
-  return applyAlias(raw, { ...BASE_PRODUCT_ALIASES, ...((catalog && catalog.aliases) || {}) });
+  const c = catalog || DEFAULT_PRODUCT_CATALOG;
+  return applyAlias(raw, c.aliases || {});
 }
 
 function normalizeCauseName(raw, catalog) {
-  return applyAlias(raw, { ...BASE_CAUSE_ALIASES, ...((catalog && catalog.causeAliases) || {}) });
+  const c = catalog || DEFAULT_PRODUCT_CATALOG;
+  return applyAlias(raw, c.causeAliases || {});
 }
 
 // 실제 저장된 작업일지에서 자주 쓰인 값을 인식 사전에 자동 편입한다.
@@ -4537,8 +4522,8 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
 
   // 작업일지 입력 영역 상태
   const [inputOpen, setInputOpen] = useState(true);
-  const [ownerEditOpen, setOwnerEditOpen] = useState(false);
-  const [ownerEditText, setOwnerEditText] = useState('');
+  const [catalogEditOpen, setCatalogEditOpen] = useState(false);
+  const [catalogDraft, setCatalogDraft] = useState(null);
   const [inputDate, setInputDate] = useState(yesterday);
   const [inputOwner, setInputOwner] = useState(() => localStorage.getItem('kpi_owner_bunghal') || '');
   const [editingEntryId, setEditingEntryId] = useState(null); // 편집 중인 항목 ID (owner 변경 시 신규 생성 방지)
@@ -4803,20 +4788,91 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
     localStorage.setItem('kpi_owner_bunghal', name);
   };
 
-  const openOwnerEdit = () => {
-    setOwnerEditText((catalog.owners || []).join(', '));
-    setOwnerEditOpen(true);
+  const CATALOG_LISTS = [
+    { key: 'products',  label: '품목',     ph: '이브닝, 쿠시노, …' },
+    { key: 'causes',    label: '원인',     ph: '봉탈, 오염, …' },
+    { key: 'owners',    label: '작업자',   ph: '인터 #1, 인터 #2' },
+    { key: 'sizes',     label: '사이즈',   ph: 'S, SS, Q, K' },
+    { key: 'positions', label: '상/하',    ph: '최상단, 상, 하' },
+    { key: 'origins',   label: '원인공정', ph: '퀼팅, 인터, 업체, 수선' },
+    { key: 'actions',   label: '처리내역', ph: '수선, 폐기' },
+  ];
+
+  // 표기 통일 규칙 <-> 텍스트  ("틀린표기 -> 올바른표기" 한 줄에 하나)
+  const aliasMapToText = (m) => Object.entries(m || {}).map(([k, v]) => `${k} -> ${v}`).join('\n');
+  const aliasTextToMap = (t) => {
+    const out = {};
+    String(t || '').split('\n').forEach(line => {
+      const i = line.indexOf('->');
+      if (i < 0) return;
+      const from = line.slice(0, i).trim();
+      const to = line.slice(i + 2).trim();
+      if (from && to && from !== to) out[from] = to;
+    });
+    return out;
   };
 
-  const saveOwnerEdit = () => {
-    const list = ownerEditText.split(',').map(s => s.trim()).filter(Boolean);
-    if (!list.length) { toast('작업자 1명 이상 필요', 'warn'); return; }
-    const nextCatalog = { ...catalog, owners: list };
-    onSaveCatalog && onSaveCatalog(nextCatalog);
-    // 현재 선택된 작업자가 새 목록에 없으면 첫 번째로 변경
-    if (!list.includes(inputOwner)) handleSaveOwner(list[0]);
-    setOwnerEditOpen(false);
-    toast('작업자 목록 저장 완료', 'success');
+  const openCatalogEdit = () => {
+    const d = {};
+    CATALOG_LISTS.forEach(f => { d[f.key] = (catalog[f.key] || []).join(', '); });
+    d.aliases = aliasMapToText(catalog.aliases);
+    d.causeAliases = aliasMapToText(catalog.causeAliases);
+    setCatalogDraft(d);
+    setCatalogEditOpen(true);
+  };
+
+  // 저장된 작업일지에서 품목·원인을 채우고, 공백만 다른 표기는 통일 규칙으로 제안한다.
+  // 신제품이 나와도 여기서 한 번 눌러 확인만 하면 된다.
+  const fillCatalogFromRecords = () => {
+    const seen = {};
+    (bunghalLog || []).forEach(e => (e.records || []).forEach(r => {
+      const c = String(r.cause || '').trim();
+      if (c) seen[c] = (seen[c] || 0) + 1;
+    }));
+    const groups = {};
+    Object.keys(seen).forEach(v => {
+      const k = v.replace(/\s+/g, '');
+      (groups[k] = groups[k] || []).push(v);
+    });
+    const proposed = { ...aliasTextToMap(catalogDraft && catalogDraft.causeAliases) };
+    Object.values(groups).forEach(vs => {
+      if (vs.length < 2) return;
+      // 띄어쓰기가 있는 표기를 기준으로, 같으면 더 많이 쓰인 쪽을 기준으로
+      const target = vs.slice().sort((a, b) =>
+        (b.split(' ').length - a.split(' ').length) || (seen[b] - seen[a]))[0];
+      vs.forEach(v => { if (v !== target) proposed[v] = target; });
+    });
+    // 제안한 규칙을 먼저 얹은 사전으로 목록을 뽑아야 표기가 합쳐진 상태로 나온다.
+    // (규칙 적용 전에 뽑으면 "스펀지접힘"과 "스펀지 접힘"이 둘 다 목록에 남는다)
+    const withRules = {
+      ...catalog,
+      aliases:      aliasTextToMap((catalogDraft || {}).aliases),
+      causeAliases: proposed,
+    };
+    const eff = effectiveCatalog(withRules, bunghalLog);
+    setCatalogDraft(d => ({
+      ...d,
+      products: eff.products.join(', '),
+      causes:   eff.causes.join(', '),
+      causeAliases: aliasMapToText(proposed),
+    }));
+    toast('저장된 기록에서 채웠습니다 — 확인하고 저장하세요', 'info');
+  };
+
+  const saveCatalogEdit = () => {
+    const next = { ...catalog };
+    CATALOG_LISTS.forEach(f => {
+      next[f.key] = String((catalogDraft || {})[f.key] || '')
+        .split(',').map(s => s.trim()).filter(Boolean);
+    });
+    if (!next.owners.length) { toast('작업자 1명 이상 필요', 'warn'); return; }
+    if (!next.products.length || !next.causes.length) { toast('품목·원인은 비울 수 없습니다', 'warn'); return; }
+    next.aliases      = aliasTextToMap((catalogDraft || {}).aliases);
+    next.causeAliases = aliasTextToMap((catalogDraft || {}).causeAliases);
+    onSaveCatalog && onSaveCatalog(next);
+    if (!next.owners.includes(inputOwner)) handleSaveOwner(next.owners[0]);
+    setCatalogEditOpen(false);
+    toast('사전 저장 완료', 'success');
   };
 
   // 저장된 기록으로 보강한 사전 — 자동완성과 인식에 함께 쓴다
@@ -5534,8 +5590,8 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
               <option value="">선택</option>
               {(catalog.owners || []).map(o => <option key={o} value={o}>{o}</option>)}
             </select>
-            <button onClick={openOwnerEdit}
-              title="작업자 목록 편집"
+            <button onClick={openCatalogEdit}
+              title="사전 편집 — 품목·원인·작업자·표기 통일"
               className="text-slate-400 hover:text-slate-700 text-xs leading-none">✎</button>
           </div>
             );
@@ -5546,17 +5602,57 @@ function BunghalAnalysisTab({ data, onSave, onSaveLog, onSaveCatalog, onSaveCorr
               등록됨 · {currentEntry.records?.length || 0}건
             </span>
           )}
-          {ownerEditOpen && (
-            <div className="basis-full mt-2 p-3 bg-white border border-slate-200 rounded-lg flex items-center gap-2 animate-slide-down">
-              <span className="text-[10px] text-slate-500 font-semibold whitespace-nowrap">작업자 목록 (콤마로 구분)</span>
-              <input type="text" value={ownerEditText} onChange={e => setOwnerEditText(e.target.value)}
-                placeholder="인터 #1, 인터 #2, …"
-                onKeyDown={e => e.key === 'Enter' && saveOwnerEdit()}
-                className="flex-1 px-2 py-1 text-xs border border-slate-200 rounded focus:outline-none focus:ring-2 focus:ring-violet-300" />
-              <button onClick={saveOwnerEdit}
-                className="px-3 py-1.5 text-[10px] font-semibold rounded bg-violet-500 hover:bg-violet-600 text-white">저장</button>
-              <button onClick={() => setOwnerEditOpen(false)}
-                className="px-2 py-1.5 text-[10px] rounded bg-slate-100 hover:bg-slate-200 text-slate-600">취소</button>
+          {catalogEditOpen && catalogDraft && (
+            <div className="basis-full mt-2 p-4 bg-white border border-slate-200 rounded-lg animate-slide-down">
+              <div className="flex items-center justify-between mb-3">
+                <div className="text-xs font-bold text-slate-700">사전 편집</div>
+                <button onClick={fillCatalogFromRecords}
+                  title="저장된 작업일지에 실제로 쓰인 품목·원인을 채우고, 띄어쓰기만 다른 표기는 통일 규칙으로 제안합니다"
+                  className="text-[10px] px-2.5 py-1 rounded border border-slate-200 text-slate-600 hover:bg-slate-50 font-semibold">
+                  저장된 기록에서 채우기
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-x-4 gap-y-2.5">
+                {CATALOG_LISTS.map(f => (
+                  <div key={f.key} className={f.key === 'products' || f.key === 'causes' ? 'lg:col-span-2' : ''}>
+                    <label className="block text-[10px] text-slate-500 font-semibold mb-1">
+                      {f.label} <span className="text-slate-400 font-normal">· 콤마로 구분</span>
+                    </label>
+                    <input type="text" value={catalogDraft[f.key] || ''}
+                      onChange={e => setCatalogDraft(d => ({ ...d, [f.key]: e.target.value }))}
+                      placeholder={f.ph}
+                      className="w-full px-2 py-1.5 text-xs border border-slate-200 rounded focus:outline-none focus:ring-2 focus:ring-violet-300" />
+                  </div>
+                ))}
+              </div>
+
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mt-3">
+                {[{ key: 'aliases', label: '품목 표기 통일', ph: '데일리 투인원 -> 투인원' },
+                  { key: 'causeAliases', label: '원인 표기 통일', ph: '구멍 -> 원단구멍' }].map(f => (
+                  <div key={f.key}>
+                    <label className="block text-[10px] text-slate-500 font-semibold mb-1">
+                      {f.label} <span className="text-slate-400 font-normal">· 한 줄에 하나, {'"'}틀린표기 -&gt; 올바른표기{'"'}</span>
+                    </label>
+                    <textarea rows={5} value={catalogDraft[f.key] || ''}
+                      onChange={e => setCatalogDraft(d => ({ ...d, [f.key]: e.target.value }))}
+                      placeholder={f.ph}
+                      className="w-full px-2 py-1.5 text-xs border border-slate-200 rounded font-mono focus:outline-none focus:ring-2 focus:ring-violet-300" />
+                  </div>
+                ))}
+              </div>
+
+              <div className="text-[10px] text-slate-400 mt-2.5 leading-relaxed">
+                여기에 없는 품목·원인이라도 작업일지에 {CATALOG_AUTO_MIN_COUNT}회 이상 저장되면 사진 인식 사전에 자동으로 포함됩니다.
+                이 화면은 그 결과를 확인·수정하거나, 신제품을 미리 등록할 때 씁니다.
+              </div>
+
+              <div className="flex items-center gap-2 mt-3">
+                <button onClick={saveCatalogEdit}
+                  className="px-3 py-1.5 text-[10px] font-semibold rounded bg-violet-500 hover:bg-violet-600 text-white">저장</button>
+                <button onClick={() => setCatalogEditOpen(false)}
+                  className="px-2.5 py-1.5 text-[10px] rounded bg-slate-100 hover:bg-slate-200 text-slate-600">취소</button>
+              </div>
             </div>
           )}
         </div>
